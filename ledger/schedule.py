@@ -35,12 +35,15 @@ def build_schedule(total: Decimal, months: int, first_date: date, paid_total: De
         due = add_months(first_date, i)
         covered = min(amount, max(left_to_apply, Decimal("0")))
         left_to_apply -= covered
+        # Money on an installment shows as "partial" even when it is late; lateness is
+        # reported separately by `is_overdue` so the overdue count still includes it.
+        is_overdue = covered < amount and due < today
         if covered >= amount:
             status = "paid"
-        elif due < today:
-            status = "overdue"
         elif covered > 0:
             status = "partial"
+        elif is_overdue:
+            status = "overdue"
         else:
             status = "upcoming"
         rows.append(
@@ -50,6 +53,7 @@ def build_schedule(total: Decimal, months: int, first_date: date, paid_total: De
                 "amount": amount,
                 "paid_amount": covered,
                 "status": status,
+                "is_overdue": is_overdue,
             }
         )
     return rows
@@ -101,7 +105,7 @@ def plan_figures(plan, today: date | None = None):
         "months_left": len(open_rows),
         "progress_percent": float((paid / plan.total_amount * 100).quantize(Decimal("0.1"))) if plan.total_amount else 0.0,
         "is_complete": remaining == 0,
-        "overdue_count": sum(1 for r in schedule if r["status"] == "overdue"),
+        "overdue_count": sum(1 for r in schedule if r["is_overdue"]),
         "next_due_date": next_due["due_date"] if next_due else None,
         "next_due_amount": (next_due["amount"] - next_due["paid_amount"]) if next_due else Decimal("0.00"),
         "final_due_date": add_months(plan.first_payment_date, plan.months - 1),

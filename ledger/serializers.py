@@ -126,9 +126,11 @@ class PaymentSerializer(serializers.ModelSerializer):
 class ScheduleRowSerializer(serializers.Serializer):
     number = serializers.IntegerField()
     due_date = serializers.DateField()
-    amount = MONEY
-    paid_amount = MONEY
+    # One field instance per attribute: sharing MONEY here made DRF emit only `paid_amount`.
+    amount = serializers.DecimalField(max_digits=14, decimal_places=2)
+    paid_amount = serializers.DecimalField(max_digits=14, decimal_places=2)
     status = serializers.CharField()
+    is_overdue = serializers.BooleanField()
 
 
 class PlanSerializer(serializers.ModelSerializer):

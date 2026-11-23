@@ -33,6 +33,26 @@ class ScheduleMathTests(SimpleTestCase):
         self.assertEqual(rows[1]["paid_amount"], Decimal("37.50"))
         self.assertEqual(rows[2]["status"], "upcoming")
 
+    def test_late_installment_with_money_on_it_is_partial_and_overdue(self):
+        # $224.20 paid on $75/month: #1 and #2 paid, #3 has $74.20, #4 nothing; both are past due.
+        rows = build_schedule(Decimal("1350"), 18, date(2026, 8, 22), Decimal("224.20"), date(2026, 11, 23))
+        self.assertEqual(rows[2]["status"], "partial")
+        self.assertTrue(rows[2]["is_overdue"])
+        self.assertEqual(rows[3]["status"], "overdue")
+        self.assertTrue(rows[3]["is_overdue"])
+        self.assertFalse(rows[1]["is_overdue"])
+        self.assertFalse(rows[4]["is_overdue"])
+
+    def test_schedule_row_serializer_keeps_amount_and_paid_amount_apart(self):
+        from .serializers import ScheduleRowSerializer
+
+        rows = build_schedule(Decimal("1350"), 18, date(2026, 8, 22), Decimal("224.20"), date(2026, 11, 23))
+        data = ScheduleRowSerializer(rows, many=True).data[2]
+        self.assertEqual(data["amount"], "75.00")
+        self.assertEqual(data["paid_amount"], "74.20")
+        self.assertEqual(data["status"], "partial")
+        self.assertTrue(data["is_overdue"])
+
 
 class LedgerApiTests(APITestCase):
     def setUp(self):
