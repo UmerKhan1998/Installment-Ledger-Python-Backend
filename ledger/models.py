@@ -64,7 +64,12 @@ class Payment(models.Model):
     sent_currency = models.CharField(max_length=3, choices=CURRENCY_CHOICES, blank=True)
     exchange_rate = models.DecimalField(max_digits=14, decimal_places=4, null=True, blank=True)
     paid_on = models.DateField()
+    paid_time = models.TimeField(null=True, blank=True)
     note = models.CharField(max_length=255, blank=True)
+    # Receipt image kept in the database (no file storage needed on Render); compressed client-side.
+    receipt_data = models.BinaryField(null=True, blank=True, editable=False)
+    receipt_type = models.CharField(max_length=50, blank=True)
+    receipt_name = models.CharField(max_length=200, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

@@ -5,6 +5,8 @@ from decimal import Decimal
 
 from django.core.cache import cache
 
+from django.db.models import Prefetch
+from django.http import Http404, HttpResponse
 from django.shortcuts import get_object_or_404
 from rest_framework import generics
 from rest_framework.response import Response
@@ -16,7 +18,9 @@ from .serializers import PaymentSerializer, PlanSerializer
 
 
 def user_plans(request):
-    return Plan.objects.filter(user=request.user).prefetch_related("payments")
+    # Receipt images are only loaded by ReceiptView, never in lists.
+    payments = Prefetch("payments", queryset=Payment.objects.defer("receipt_data"))
+    return Plan.objects.filter(user=request.user).prefetch_related(payments)
 
 
 class PlanListCreateView(generics.ListCreateAPIView):
@@ -73,6 +77,19 @@ class PaymentListCreateView(PlanPaymentMixin, generics.ListCreateAPIView):
 
 class PaymentDetailView(PlanPaymentMixin, generics.RetrieveUpdateDestroyAPIView):
     pass
+
+
+class ReceiptView(PlanPaymentMixin, APIView):
+    """GET /api/plans/{plan_id}/payments/{pk}/receipt/ -> the uploaded receipt image."""
+
+    def get(self, request, plan_id, pk):
+        payment = get_object_or_404(self.get_queryset(), pk=pk)
+        if not payment.receipt_type or payment.receipt_data is None:
+            raise Http404
+        response = HttpResponse(bytes(payment.receipt_data), content_type=payment.receipt_type)
+        response["Content-Disposition"] = f'inline; filename="{payment.receipt_name or "receipt"}"'
+        response["Cache-Control"] = "private, max-age=3600"
+        return response
 
 
 class SummaryView(APIView):

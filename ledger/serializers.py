@@ -6,6 +6,7 @@ from .models import Payment, Plan
 from .schedule import plan_figures, to_cents
 
 MONEY = serializers.DecimalField(max_digits=14, decimal_places=2)
+MAX_RECEIPT_BYTES = 4 * 1024 * 1024
 RATE = serializers.DecimalField(max_digits=14, decimal_places=4)
 
 
@@ -21,10 +22,40 @@ class PaymentSerializer(serializers.ModelSerializer):
         max_digits=14, decimal_places=4, min_value=Decimal("0.0001"), required=False, allow_null=True
     )
 
+    receipt = serializers.ImageField(write_only=True, required=False, allow_null=True)
+    has_receipt = serializers.SerializerMethodField()
+
     class Meta:
         model = Payment
-        fields = ("id", "amount", "sent_amount", "sent_currency", "exchange_rate", "paid_on", "note", "created_at")
+        fields = (
+            "id", "amount", "sent_amount", "sent_currency", "exchange_rate", "paid_on", "paid_time",
+            "note", "receipt", "has_receipt", "created_at",
+        )
         read_only_fields = ("id", "created_at")
+
+    def get_has_receipt(self, obj):
+        return bool(obj.receipt_type)
+
+    def validate_receipt(self, file):
+        if file and file.size > MAX_RECEIPT_BYTES:
+            raise serializers.ValidationError(f"Receipt must be under {MAX_RECEIPT_BYTES // (1024 * 1024)} MB.")
+        return file
+
+    def _store_receipt(self, validated_data):
+        file = validated_data.pop("receipt", None)
+        if file:
+            validated_data.update(
+                receipt_data=file.read(),
+                receipt_type=getattr(file, "content_type", "") or "image/jpeg",
+                receipt_name=(file.name or "receipt")[:200],
+            )
+        return validated_data
+
+    def create(self, validated_data):
+        return super().create(self._store_receipt(validated_data))
+
+    def update(self, instance, validated_data):
+        return super().update(instance, self._store_receipt(validated_data))
 
     def validate(self, attrs):
         plan = self.context["plan"]

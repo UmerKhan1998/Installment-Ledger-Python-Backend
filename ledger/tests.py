@@ -233,3 +233,65 @@ class DatedRateTests(APITestCase):
 
     def test_bad_date_is_400(self):
         self.assertEqual(self.client.get("/api/rates/?base=USD&quote=PKR&date=yesterday").status_code, 400)
+
+
+class ReceiptTests(APITestCase):
+    def setUp(self):
+        res = self.client.post("/api/auth/register/", {"email": "rc@example.com", "password": "Sup3r-secret!"}, format="json")
+        self.token = res.data["access"]
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.token}")
+        self.plan = self.client.post(
+            "/api/plans/",
+            {"item": "MacBook", "purchase_price": "1199", "total_amount": "1350", "months": 18,
+             "first_payment_date": "2026-11-21", "payment_currency": "PKR", "exchange_rate": "276.5"},
+            format="json",
+        ).data
+
+    def png(self):
+        import io
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.new("RGB", (20, 20), "white").save(buf, "PNG")
+        return SimpleUploadedFile("receipt.png", buf.getvalue(), content_type="image/png")
+
+    def test_upload_receipt_with_ocr_values(self):
+        pid = self.plan["id"]
+        res = self.client.post(
+            f"/api/plans/{pid}/payments/",
+            {"sent_amount": "13750", "sent_currency": "PKR", "exchange_rate": "276.5", "paid_on": "2026-11-21",
+             "paid_time": "21:24", "note": "Receipt · Ref 972228", "receipt": self.png()},
+            format="multipart",
+        )
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertTrue(res.data["has_receipt"])
+        self.assertEqual(res.data["paid_time"], "21:24:00")
+        self.assertEqual(res.data["amount"], "49.73")  # 13750 / 276.5
+        self.assertNotIn("receipt_data", res.data)
+
+        img = self.client.get(f"/api/plans/{pid}/payments/{res.data['id']}/receipt/")
+        self.assertEqual(img.status_code, 200)
+        self.assertEqual(img["Content-Type"], "image/png")
+
+        # Lists never carry the image bytes.
+        detail = self.client.get(f"/api/plans/{pid}/").data
+        self.assertTrue(detail["payments"][0]["has_receipt"])
+
+    def test_non_image_is_rejected(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        res = self.client.post(
+            f"/api/plans/{self.plan['id']}/payments/",
+            {"sent_amount": "100", "paid_on": "2026-11-21", "receipt": SimpleUploadedFile("x.png", b"not an image")},
+            format="multipart",
+        )
+        self.assertEqual(res.status_code, 400)
+
+    def test_receipt_of_other_user_is_hidden(self):
+        pid = self.plan["id"]
+        pay = self.client.post(
+            f"/api/plans/{pid}/payments/",
+            {"sent_amount": "100", "paid_on": "2026-11-21", "receipt": self.png()}, format="multipart",
+        ).data
+        other = self.client.post("/api/auth/register/", {"email": "o@example.com", "password": "Sup3r-secret!"}, format="json")
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {other.data['access']}")
+        self.assertEqual(self.client.get(f"/api/plans/{pid}/payments/{pay['id']}/receipt/").status_code, 404)

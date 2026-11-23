@@ -6,6 +6,7 @@ from .views import (
     PaymentListCreateView,
     PlanDetailView,
     PlanListCreateView,
+    ReceiptView,
     SummaryView,
 )
 
@@ -16,4 +17,5 @@ urlpatterns = [
     path("plans/<int:pk>/", PlanDetailView.as_view(), name="plan-detail"),
     path("plans/<int:plan_id>/payments/", PaymentListCreateView.as_view(), name="payment-list"),
     path("plans/<int:plan_id>/payments/<int:pk>/", PaymentDetailView.as_view(), name="payment-detail"),
+    path("plans/<int:plan_id>/payments/<int:pk>/receipt/", ReceiptView.as_view(), name="payment-receipt"),
 ]
