@@ -2,6 +2,7 @@ from decimal import Decimal
 
 from rest_framework import serializers
 
+from .duplicates import describe, file_hash, find_duplicate, normalize_hash, normalize_reference
 from .models import Payment, Plan
 from .schedule import plan_figures, to_cents
 
@@ -29,8 +30,9 @@ class PaymentSerializer(serializers.ModelSerializer):
         model = Payment
         fields = (
             "id", "amount", "sent_amount", "sent_currency", "exchange_rate", "paid_on", "paid_time",
-            "note", "receipt", "has_receipt", "created_at",
+            "note", "reference", "receipt_hash", "receipt", "has_receipt", "created_at",
         )
+        extra_kwargs = {"receipt_hash": {"write_only": True}}
         read_only_fields = ("id", "created_at")
 
     def get_has_receipt(self, obj):
@@ -59,6 +61,34 @@ class PaymentSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         plan = self.context["plan"]
+        attrs = self._validate_amounts(plan, attrs)
+        self._reject_duplicate(plan, attrs)
+        return attrs
+
+    def _reject_duplicate(self, plan, attrs):
+        attrs["reference"] = normalize_reference(attrs.get("reference", getattr(self.instance, "reference", "")))
+        # Fingerprint of the original file (sent by the browser); fall back to hashing the upload itself.
+        given = normalize_hash(attrs.get("receipt_hash"))
+        receipt = attrs.get("receipt")
+        attrs["receipt_hash"] = given or (file_hash(receipt) if receipt else getattr(self.instance, "receipt_hash", ""))
+
+        inst = self.instance
+        match, reason = find_duplicate(
+            plan.user,
+            reference=attrs["reference"],
+            receipt_hash=attrs["receipt_hash"],
+            plan=plan,
+            paid_on=attrs.get("paid_on", getattr(inst, "paid_on", None)),
+            paid_time=attrs.get("paid_time", getattr(inst, "paid_time", None)),
+            amount=attrs.get("amount", getattr(inst, "amount", None)),
+            exclude_pk=getattr(inst, "pk", None),
+        )
+        if match:
+            raise serializers.ValidationError(
+                {"duplicate": f"This payment is already recorded ({reason}): {describe(match)}."}
+            )
+
+    def _validate_amounts(self, plan, attrs):
         sent = attrs.get("sent_amount")
         converted = False
 

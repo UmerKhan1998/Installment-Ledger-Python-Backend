@@ -1,6 +1,7 @@
 from django.urls import path
 
 from .views import (
+    DuplicateCheckView,
     LiveRateView,
     PaymentDetailView,
     PaymentListCreateView,
@@ -13,6 +14,7 @@ from .views import (
 urlpatterns = [
     path("summary/", SummaryView.as_view(), name="summary"),
     path("rates/", LiveRateView.as_view(), name="rates"),
+    path("payments/duplicate-check/", DuplicateCheckView.as_view(), name="duplicate-check"),
     path("plans/", PlanListCreateView.as_view(), name="plan-list"),
     path("plans/<int:pk>/", PlanDetailView.as_view(), name="plan-detail"),
     path("plans/<int:plan_id>/payments/", PaymentListCreateView.as_view(), name="payment-list"),

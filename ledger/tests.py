@@ -295,3 +295,75 @@ class ReceiptTests(APITestCase):
         other = self.client.post("/api/auth/register/", {"email": "o@example.com", "password": "Sup3r-secret!"}, format="json")
         self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {other.data['access']}")
         self.assertEqual(self.client.get(f"/api/plans/{pid}/payments/{pay['id']}/receipt/").status_code, 404)
+
+
+class DuplicateReceiptTests(APITestCase):
+    def setUp(self):
+        res = self.client.post("/api/auth/register/", {"email": "dup@example.com", "password": "Sup3r-secret!"}, format="json")
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {res.data['access']}")
+        body = {"purchase_price": "1199", "total_amount": "1350", "months": 18, "first_payment_date": "2026-08-01",
+                "payment_currency": "PKR", "exchange_rate": "277.5525"}
+        self.plan = self.client.post("/api/plans/", {"item": "MacBook", **body}, format="json").data
+        self.other_plan = self.client.post("/api/plans/", {"item": "iPhone", **body}, format="json").data
+
+    def pay(self, plan_id=None, **extra):
+        body = {"sent_amount": "20820", "exchange_rate": "277.5525", "paid_on": "2026-09-01", "paid_time": "10:04", **extra}
+        return self.client.post(f"/api/plans/{plan_id or self.plan['id']}/payments/", body, format="json")
+
+    def test_same_reference_is_rejected_even_on_another_plan(self):
+        self.assertEqual(self.pay(reference="100441").status_code, 201)
+        again = self.pay(plan_id=self.other_plan["id"], reference=" 100441 ", paid_time="11:00")
+        self.assertEqual(again.status_code, 400)
+        self.assertIn("reference 100441", again.data["duplicate"][0])
+        self.assertIn('"MacBook"', again.data["duplicate"][0])
+
+    def test_same_receipt_file_is_rejected(self):
+        h = "a" * 64
+        self.assertEqual(self.pay(receipt_hash=h).status_code, 201)
+        again = self.pay(receipt_hash=h.upper(), paid_time="12:00", sent_amount="100")
+        self.assertEqual(again.status_code, 400)
+        self.assertIn("same receipt image", again.data["duplicate"][0])
+
+    def test_same_date_time_amount_is_rejected(self):
+        self.assertEqual(self.pay().status_code, 201)
+        self.assertEqual(self.pay().status_code, 400)
+
+    def test_same_amount_same_day_without_time_is_allowed(self):
+        self.assertEqual(self.pay(paid_time=None).status_code, 201)
+        self.assertEqual(self.pay(paid_time=None).status_code, 201)
+
+    def test_server_hashes_upload_when_browser_sends_no_hash(self):
+        img = ReceiptTests.png(None)
+        first = self.client.post(
+            f"/api/plans/{self.plan['id']}/payments/",
+            {"sent_amount": "100", "paid_on": "2026-09-02", "receipt": img}, format="multipart",
+        )
+        self.assertEqual(first.status_code, 201, first.data)
+        img2 = ReceiptTests.png(None)
+        again = self.client.post(
+            f"/api/plans/{self.plan['id']}/payments/",
+            {"sent_amount": "200", "paid_on": "2026-09-03", "receipt": img2}, format="multipart",
+        )
+        self.assertEqual(again.status_code, 400)
+
+    def test_duplicate_check_endpoint(self):
+        self.pay(reference="100441")
+        hit = self.client.get("/api/payments/duplicate-check/?reference=100441").data
+        self.assertTrue(hit["duplicate"])
+        self.assertEqual(hit["payment"]["plan_item"], "MacBook")
+        self.assertFalse(self.client.get("/api/payments/duplicate-check/?reference=999999").data["duplicate"])
+
+    def test_other_users_references_do_not_clash(self):
+        self.pay(reference="100441")
+        other = self.client.post("/api/auth/register/", {"email": "x@example.com", "password": "Sup3r-secret!"}, format="json")
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {other.data['access']}")
+        self.assertFalse(self.client.get("/api/payments/duplicate-check/?reference=100441").data["duplicate"])
+
+    def test_backfill_reads_reference_from_note(self):
+        from importlib import import_module
+        from django.apps import apps
+        from .models import Payment
+        p = Payment.objects.create(plan_id=self.plan["id"], amount="10", paid_on="2026-09-01", note="Raast · Ref 100441")
+        import_module("ledger.migrations.0005_backfill_payment_reference").backfill(apps, None)
+        p.refresh_from_db()
+        self.assertEqual(p.reference, "100441")

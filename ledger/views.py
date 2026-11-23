@@ -12,6 +12,7 @@ from rest_framework import generics
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from .duplicates import describe, find_duplicate, normalize_hash, normalize_reference
 from .models import CURRENCY_CHOICES, Payment, Plan
 from .schedule import plan_figures
 from .serializers import PaymentSerializer, PlanSerializer
@@ -77,6 +78,29 @@ class PaymentListCreateView(PlanPaymentMixin, generics.ListCreateAPIView):
 
 class PaymentDetailView(PlanPaymentMixin, generics.RetrieveUpdateDestroyAPIView):
     pass
+
+
+class DuplicateCheckView(APIView):
+    """GET /api/payments/duplicate-check/?reference=972228&receipt_hash=<sha256>
+
+    Lets the receipt scanner warn straight after OCR, before the form is filled.
+    Saving still re-checks, so this is only an early warning.
+    """
+
+    def get(self, request):
+        reference = normalize_reference(request.query_params.get("reference"))
+        receipt_hash = normalize_hash(request.query_params.get("receipt_hash"))
+        match, reason = find_duplicate(request.user, reference=reference, receipt_hash=receipt_hash)
+        if not match:
+            return Response({"duplicate": False})
+        return Response(
+            {
+                "duplicate": True,
+                "reason": reason,
+                "message": f"Already recorded ({reason}): {describe(match)}.",
+                "payment": {"id": match.id, "plan_id": match.plan_id, "plan_item": match.plan.item, "paid_on": match.paid_on},
+            }
+        )
 
 
 class ReceiptView(PlanPaymentMixin, APIView):
