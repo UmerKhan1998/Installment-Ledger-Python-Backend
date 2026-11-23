@@ -1,9 +1,12 @@
+# Render Blueprint. If the service was created by hand in the dashboard, copy these values into
+# Settings (Build Command / Start Command) and Environment instead: the dashboard wins over this file.
 services:
   - type: web
     name: installment-ledger-python-backend
     runtime: python
+    plan: free
     buildCommand: ./build.sh
-    startCommand: gunicorn config.wsgi:application --bind 0.0.0.0:$PORT --workers 2
+    startCommand: gunicorn config.wsgi:application --bind 0.0.0.0:$PORT --workers 2 --timeout 120
     healthCheckPath: /
     envVars:
       - key: PYTHON_VERSION
@@ -13,6 +16,8 @@ services:
       - key: DJANGO_SECRET_KEY
         generateValue: true
       - key: DATABASE_URL
-        sync: false   # set in the Render dashboard (Neon connection string)
+        sync: false   # Neon connection string
       - key: CORS_ALLOWED_ORIGINS
-        sync: false   # e.g. https://your-frontend.onrender.com
+        sync: false   # https://<your-app>.vercel.app  (no trailing slash)
+      - key: CORS_ALLOWED_ORIGIN_REGEXES
+        sync: false   # optional, Vercel previews: ^https://installment-ledger[a-z0-9-]*\.vercel\.app$

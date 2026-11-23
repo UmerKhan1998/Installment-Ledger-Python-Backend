@@ -4,6 +4,7 @@ from datetime import timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -22,6 +23,8 @@ def env_list(name, default=""):
 ON_RENDER = env_bool("RENDER")
 
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "dev-insecure-change-me")
+if ON_RENDER and SECRET_KEY == "dev-insecure-change-me":
+    raise ImproperlyConfigured("DJANGO_SECRET_KEY is not set. Add a long random value in Render -> Environment.")
 DEBUG = env_bool("DJANGO_DEBUG", not ON_RENDER)
 ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1")
 RENDER_HOST = os.getenv("RENDER_EXTERNAL_HOSTNAME")
@@ -95,6 +98,9 @@ if env_bool("USE_SQLITE"):
     DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": BASE_DIR / "db.sqlite3"}}
 elif os.getenv("DATABASE_URL"):
     DATABASES = {"default": postgres_from_url(os.environ["DATABASE_URL"])}
+elif ON_RENDER:
+    # Without this the app would silently try localhost:5432 and every API call would 500.
+    raise ImproperlyConfigured("DATABASE_URL is not set. Add the Neon connection string in Render -> Environment.")
 else:
     DATABASES = {
         "default": {
@@ -126,7 +132,13 @@ STORAGES = {
 }
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
-CORS_ALLOWED_ORIGINS = env_list("CORS_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
+# Frontend origins allowed to call the API, e.g. "https://installment-ledger.vercel.app".
+# A trailing slash or path would make django-cors-headers fail its checks (and the deploy), so strip it.
+CORS_ALLOWED_ORIGINS = [
+    o.rstrip("/") for o in env_list("CORS_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
+]
+# Regexes for changing hostnames, e.g. Vercel preview deployments: ^https://installment-ledger[a-z0-9-]*\.vercel\.app$
+CORS_ALLOWED_ORIGIN_REGEXES = env_list("CORS_ALLOWED_ORIGIN_REGEXES")
 CSRF_TRUSTED_ORIGINS = [f"https://{RENDER_HOST}"] if RENDER_HOST else []
 
 if not DEBUG:
