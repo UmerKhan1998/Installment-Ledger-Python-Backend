@@ -192,3 +192,44 @@ class CurrencyExchangeTests(APITestCase):
         # A back-dated payment does not override the newer rate.
         self.client.post(f"/api/plans/{pid}/payments/", {"sent_amount": "20000", "exchange_rate": "270", "paid_on": "2026-11-01"}, format="json")
         self.assertEqual(self.client.get(f"/api/plans/{pid}/").data["exchange_rate"], "280.0000")
+
+
+class DatedRateTests(APITestCase):
+    """/api/rates/ picks the rate for the payment date (network mocked)."""
+
+    def setUp(self):
+        res = self.client.post("/api/auth/register/", {"email": "r@example.com", "password": "Sup3r-secret!"}, format="json")
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {res.data['access']}")
+
+    def fake_source(self, published):
+        def fake(base, quote, tag):
+            if tag in published:
+                return {"rate": Decimal(published[tag]), "date": tag if tag != "latest" else "2026-11-22", "source": "test"}
+            return None
+        return fake
+
+    def test_past_date_uses_that_days_rate(self):
+        from unittest import mock
+        with mock.patch("ledger.views._dated_rate", self.fake_source({"2026-06-15": "278.2685"})):
+            res = self.client.get("/api/rates/?base=USD&quote=PKR&date=2026-06-15")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["rate"], "278.2685")
+        self.assertEqual(res.data["date"], "2026-06-15")
+
+    def test_missing_day_falls_back_to_earlier_day(self):
+        from unittest import mock
+        with mock.patch("ledger.views._dated_rate", self.fake_source({"2026-06-13": "279.0000"})):
+            res = self.client.get("/api/rates/?base=USD&quote=PKR&date=2026-06-15")
+        self.assertEqual(res.data["date"], "2026-06-13")
+
+    def test_future_date_uses_latest(self):
+        from unittest import mock
+        with mock.patch("ledger.views._dated_rate", self.fake_source({"latest": "276.4819"})):
+            res = self.client.get("/api/rates/?base=USD&quote=PKR&date=2099-01-01")
+        self.assertEqual(res.data["rate"], "276.4819")
+
+    def test_before_history_is_404(self):
+        self.assertEqual(self.client.get("/api/rates/?base=USD&quote=PKR&date=2019-05-24").status_code, 404)
+
+    def test_bad_date_is_400(self):
+        self.assertEqual(self.client.get("/api/rates/?base=USD&quote=PKR&date=yesterday").status_code, 400)

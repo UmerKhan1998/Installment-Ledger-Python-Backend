@@ -1,6 +1,6 @@
 import json
 import urllib.request
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 from django.core.cache import cache
@@ -126,13 +126,58 @@ class SummaryView(APIView):
 
 
 SUPPORTED = {code for code, _ in CURRENCY_CHOICES}
-RATE_SOURCE = "https://open.er-api.com/v6/latest/{base}"
+
+# Daily rates (incl. PKR) by date, from 2024-03 onwards; two mirrors of the same dataset.
+DATED_SOURCES = [
+    "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@{tag}/v1/currencies/{base}.min.json",
+    "https://{tag}.currency-api.pages.dev/v1/currencies/{base}.min.json",
+]
+LATEST_FALLBACK = "https://open.er-api.com/v6/latest/{base}"
+HISTORY_START = date(2024, 3, 2)
+LOOKBACK_DAYS = 5  # a missing day falls back to the closest earlier published day
+
+
+def _fetch_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "installment-ledger/1.0"})
+    with urllib.request.urlopen(req, timeout=6) as res:
+        return json.load(res)
+
+
+def _dated_rate(base, quote, tag):
+    """Rate for one day (tag = 'YYYY-MM-DD' or 'latest'), or None if not published."""
+    key = f"fx:{base}:{quote}:{tag}"
+    cached = cache.get(key)
+    if cached:
+        return cached
+    for template in DATED_SOURCES:
+        try:
+            data = _fetch_json(template.format(tag=tag, base=base.lower()))
+            value = data[base.lower()][quote.lower()]
+        except Exception:
+            continue
+        result = {"rate": Decimal(str(value)), "date": data.get("date", tag), "source": "fawazahmed0/currency-api"}
+        cache.set(key, result, 60 * 60 if tag == "latest" else 60 * 60 * 24 * 30)
+        return result
+    return None
+
+
+def _latest_rate(base, quote):
+    result = _dated_rate(base, quote, "latest")
+    if result:
+        return result
+    try:
+        data = _fetch_json(LATEST_FALLBACK.format(base=base))
+        value = data["rates"][quote]
+    except Exception:
+        return None
+    return {"rate": Decimal(str(value)), "date": date.today().isoformat(), "source": "open.er-api.com"}
 
 
 class LiveRateView(APIView):
-    """GET /api/rates/?base=USD&quote=PKR -> today's market rate (cached for an hour).
+    """GET /api/rates/?base=USD&quote=PKR[&date=YYYY-MM-DD] -> market rate for that day.
 
-    Only a suggestion: the plan and each payment store the rate the user actually got.
+    No date, today or a future date -> latest rate. A past date -> that day's rate (or the
+    closest earlier published day). Only a suggestion: each payment stores the rate the user saves.
     """
 
     def get(self, request):
@@ -140,26 +185,38 @@ class LiveRateView(APIView):
         quote = request.query_params.get("quote", "PKR").upper()
         if base not in SUPPORTED or quote not in SUPPORTED:
             return Response({"detail": "Unsupported currency."}, status=400)
-        key = f"fx:{base}"
-        data = cache.get(key)
-        if data is None:
-            try:
-                with urllib.request.urlopen(RATE_SOURCE.format(base=base), timeout=6) as res:
-                    data = json.load(res)
-                if data.get("result") != "success":
-                    raise ValueError("rate service error")
-                cache.set(key, data, 60 * 60)
-            except Exception:
-                return Response({"detail": "Live rate is unavailable right now. Enter the rate manually."}, status=503)
-        rate = data.get("rates", {}).get(quote)
-        if rate is None:
-            return Response({"detail": f"No rate for {quote}."}, status=404)
+        if base == quote:
+            return Response({"base": base, "quote": quote, "rate": "1.0000", "date": None, "source": None})
+
+        raw = request.query_params.get("date")
+        try:
+            wanted = date.fromisoformat(raw) if raw else None
+        except ValueError:
+            return Response({"detail": "date must be YYYY-MM-DD."}, status=400)
+
+        today = date.today()
+        if wanted is None or wanted >= today:
+            result = _latest_rate(base, quote)
+        elif wanted < HISTORY_START:
+            return Response(
+                {"detail": f"No market rates before {HISTORY_START:%b %d, %Y}. Enter the rate manually."}, status=404
+            )
+        else:
+            result = None
+            for back in range(LOOKBACK_DAYS + 1):
+                result = _dated_rate(base, quote, (wanted - timedelta(days=back)).isoformat())
+                if result:
+                    break
+
+        if not result:
+            return Response({"detail": "Market rate is unavailable right now. Enter the rate manually."}, status=503)
         return Response(
             {
                 "base": base,
                 "quote": quote,
-                "rate": f"{Decimal(str(rate)):.4f}",
-                "updated_at": data.get("time_last_update_utc"),
-                "source": "open.er-api.com",
+                "rate": f"{result['rate']:.4f}",
+                "date": result["date"],
+                "requested_date": wanted.isoformat() if wanted else None,
+                "source": result["source"],
             }
         )
