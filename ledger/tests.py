@@ -113,3 +113,82 @@ class AuthFlowTests(APITestCase):
         self.client.post("/api/auth/register/", {"email": "a@example.com", "password": "Sup3r-secret!"}, format="json")
         res = self.client.post("/api/auth/login/", {"email": "a@example.com", "password": "nope"}, format="json")
         self.assertEqual(res.status_code, 400)
+
+
+class CurrencyExchangeTests(APITestCase):
+    """Debt in USD, money sent in PKR at 1 USD = 275.77 PKR."""
+
+    def setUp(self):
+        res = self.client.post("/api/auth/register/", {"email": "fx@example.com", "password": "Sup3r-secret!"}, format="json")
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {res.data['access']}")
+        plan = self.client.post(
+            "/api/plans/",
+            {
+                "item": "MacBook", "purchase_price": "1199", "total_amount": "1350", "months": 18,
+                "first_payment_date": "2026-11-23", "currency": "USD", "payment_currency": "PKR",
+                "exchange_rate": "275.77",
+            },
+            format="json",
+        )
+        self.assertEqual(plan.status_code, 201, plan.data)
+        self.plan = plan.data
+
+    def test_plan_shows_pkr_figures(self):
+        conv = self.plan["conversion"]
+        self.assertEqual(conv["currency"], "PKR")
+        self.assertEqual(conv["monthly_amount"], "20682.75")   # 75 x 275.77
+        self.assertEqual(conv["remaining_amount"], "372289.50")  # 1350 x 275.77
+
+    def test_pkr_payment_is_converted_to_usd(self):
+        pid = self.plan["id"]
+        res = self.client.post(f"/api/plans/{pid}/payments/", {"sent_amount": "20682.75", "paid_on": "2026-11-23"}, format="json")
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertEqual(res.data["amount"], "75.00")
+        self.assertEqual(res.data["sent_currency"], "PKR")
+        self.assertEqual(res.data["exchange_rate"], "275.7700")
+
+        # Next month the rupee is weaker; that payment keeps its own rate.
+        res = self.client.post(
+            f"/api/plans/{pid}/payments/",
+            {"sent_amount": "21000", "exchange_rate": "280", "paid_on": "2026-12-23"},
+            format="json",
+        )
+        self.assertEqual(res.data["amount"], "75.00")
+        detail = self.client.get(f"/api/plans/{pid}/").data
+        self.assertEqual(detail["paid_amount"], "150.00")
+        self.assertEqual(detail["conversion"]["sent_total"], "41682.75")
+        self.assertEqual(detail["months_left"], 16)
+
+        summary = self.client.get("/api/summary/").data
+        self.assertEqual(summary["total_left"], "1200.00")
+        self.assertEqual(summary["payment_totals"][0]["currency"], "PKR")
+        # The newest payment (Dec, @280) set the plan rate, so remaining = 1200 x 280.
+        self.assertEqual(summary["payment_totals"][0]["total_left"], "336000.00")
+
+    def test_usd_payment_still_works(self):
+        res = self.client.post(f"/api/plans/{self.plan['id']}/payments/", {"amount": "75", "paid_on": "2026-11-23"}, format="json")
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertIsNone(res.data["sent_amount"])
+
+    def test_final_pkr_payment_rounding_settles_plan(self):
+        pid = self.plan["id"]
+        res = self.client.post(f"/api/plans/{pid}/payments/", {"sent_amount": "372289.52", "paid_on": "2026-11-23"}, format="json")
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertTrue(self.client.get(f"/api/plans/{pid}/").data["is_complete"])
+
+    def test_rate_required_when_currencies_differ(self):
+        res = self.client.post(
+            "/api/plans/",
+            {"item": "X", "purchase_price": "1", "total_amount": "10", "months": 12,
+             "first_payment_date": "2026-11-23", "payment_currency": "PKR"},
+            format="json",
+        )
+        self.assertEqual(res.status_code, 400)
+
+    def test_newest_payment_rate_becomes_plan_rate(self):
+        pid = self.plan["id"]
+        self.client.post(f"/api/plans/{pid}/payments/", {"sent_amount": "21000", "exchange_rate": "280", "paid_on": "2026-12-01"}, format="json")
+        self.assertEqual(self.client.get(f"/api/plans/{pid}/").data["exchange_rate"], "280.0000")
+        # A back-dated payment does not override the newer rate.
+        self.client.post(f"/api/plans/{pid}/payments/", {"sent_amount": "20000", "exchange_rate": "270", "paid_on": "2026-11-01"}, format="json")
+        self.assertEqual(self.client.get(f"/api/plans/{pid}/").data["exchange_rate"], "280.0000")

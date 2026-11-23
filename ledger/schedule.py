@@ -55,6 +55,36 @@ def build_schedule(total: Decimal, months: int, first_date: date, paid_total: De
     return rows
 
 
+def to_cents(value: Decimal) -> Decimal:
+    return value.quantize(CENT, rounding=ROUND_HALF_UP)
+
+
+def payment_conversion(plan, payments, figures):
+    """Figures in the currency the money is sent in (e.g. PKR), at the plan's current rate.
+
+    `sent_total` is what was really transferred: each payment's own sent amount, so a payment
+    made at last month's rate keeps last month's rupee figure.
+    """
+    if plan.payment_currency == plan.currency:
+        return None
+    rate = plan.exchange_rate
+    sent_total = Decimal("0.00")
+    for p in payments:
+        if p.sent_currency == plan.payment_currency and p.sent_amount is not None:
+            sent_total += p.sent_amount
+        else:
+            sent_total += to_cents(p.amount * rate)
+    return {
+        "currency": plan.payment_currency,
+        "rate": rate,
+        "monthly_amount": to_cents(figures["monthly_amount"] * rate),
+        "remaining_amount": to_cents(figures["remaining_amount"] * rate),
+        "next_due_amount": to_cents(figures["next_due_amount"] * rate),
+        "total_amount": to_cents(plan.total_amount * rate),
+        "sent_total": sent_total,
+    }
+
+
 def plan_figures(plan, today: date | None = None):
     today = today or date.today()
     payments = list(plan.payments.all())
@@ -63,7 +93,7 @@ def plan_figures(plan, today: date | None = None):
     schedule = build_schedule(plan.total_amount, plan.months, plan.first_payment_date, paid, today)
     open_rows = [r for r in schedule if r["status"] != "paid"]
     next_due = open_rows[0] if open_rows else None
-    return {
+    figures = {
         "monthly_amount": monthly_amount(plan.total_amount, plan.months),
         "paid_amount": paid,
         "remaining_amount": remaining,
@@ -77,3 +107,5 @@ def plan_figures(plan, today: date | None = None):
         "final_due_date": add_months(plan.first_payment_date, plan.months - 1),
         "schedule": schedule,
     }
+    figures["conversion"] = payment_conversion(plan, payments, figures)
+    return figures

@@ -5,8 +5,25 @@ from django.core.validators import MinValueValidator
 from django.db import models
 
 
+CURRENCY_CHOICES = [
+    ("USD", "US Dollar"),
+    ("PKR", "Pakistani Rupee"),
+    ("EUR", "Euro"),
+    ("GBP", "British Pound"),
+    ("AED", "UAE Dirham"),
+    ("SAR", "Saudi Riyal"),
+    ("INR", "Indian Rupee"),
+    ("CAD", "Canadian Dollar"),
+]
+
+
 class Plan(models.Model):
-    """One thing being paid off in monthly installments (e.g. a MacBook over 18 months)."""
+    """One thing being paid off in monthly installments (e.g. a MacBook over 18 months).
+
+    `currency` is what the debt is in (USD at Best Buy). `payment_currency` is what the
+    money is actually sent in (PKR); `exchange_rate` is how many payment-currency units
+    buy 1 unit of `currency` (1 USD = 275.77 PKR) and is the default for new payments.
+    """
 
     MONTH_CHOICES = [(12, "12 months"), (18, "18 months"), (24, "24 months")]
 
@@ -17,6 +34,11 @@ class Plan(models.Model):
     total_amount = models.DecimalField(max_digits=12, decimal_places=2, validators=[MinValueValidator(Decimal("0.01"))])
     months = models.PositiveSmallIntegerField(choices=MONTH_CHOICES, default=18)
     first_payment_date = models.DateField()
+    currency = models.CharField(max_length=3, choices=CURRENCY_CHOICES, default="USD")
+    payment_currency = models.CharField(max_length=3, choices=CURRENCY_CHOICES, default="USD")
+    exchange_rate = models.DecimalField(
+        max_digits=14, decimal_places=4, default=Decimal("1"), validators=[MinValueValidator(Decimal("0.0001"))]
+    )
     notes = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -29,10 +51,18 @@ class Plan(models.Model):
 
 
 class Payment(models.Model):
-    """A transfer actually sent towards a plan."""
+    """A transfer actually sent towards a plan.
+
+    `amount` is in the plan's currency and is what reduces the balance. When the money was
+    sent in another currency, `sent_amount` / `sent_currency` / `exchange_rate` record what
+    was actually transferred and the rate used that day (rates move, so each payment keeps its own).
+    """
 
     plan = models.ForeignKey(Plan, on_delete=models.CASCADE, related_name="payments")
     amount = models.DecimalField(max_digits=12, decimal_places=2, validators=[MinValueValidator(Decimal("0.01"))])
+    sent_amount = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    sent_currency = models.CharField(max_length=3, choices=CURRENCY_CHOICES, blank=True)
+    exchange_rate = models.DecimalField(max_digits=14, decimal_places=4, null=True, blank=True)
     paid_on = models.DateField()
     note = models.CharField(max_length=255, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
