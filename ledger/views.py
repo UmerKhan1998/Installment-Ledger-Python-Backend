@@ -5,6 +5,7 @@ from decimal import Decimal
 
 from django.core.cache import cache
 
+from django.db import transaction
 from django.db.models import Prefetch
 from django.http import Http404, HttpResponse
 from django.shortcuts import get_object_or_404
@@ -78,6 +79,32 @@ class PaymentListCreateView(PlanPaymentMixin, generics.ListCreateAPIView):
 
 class PaymentDetailView(PlanPaymentMixin, generics.RetrieveUpdateDestroyAPIView):
     pass
+
+
+class PaymentBulkDeleteView(PlanPaymentMixin, APIView):
+    """POST /api/plans/{plan_id}/payments/bulk-delete/  {"ids": [1, 2, 3]}
+
+    All-or-nothing: if any id is not a payment of this plan, nothing is deleted.
+    """
+
+    MAX_IDS = 500
+
+    def post(self, request, plan_id):
+        ids = request.data.get("ids")
+        if not isinstance(ids, list) or not ids or len(ids) > self.MAX_IDS:
+            return Response({"detail": f"Send 1 to {self.MAX_IDS} payment ids in \"ids\"."}, status=400)
+        try:
+            ids = {int(i) for i in ids}
+        except (TypeError, ValueError):
+            return Response({"detail": "Payment ids must be numbers."}, status=400)
+        with transaction.atomic():
+            payments = self.get_queryset().filter(pk__in=ids)
+            found = set(payments.values_list("pk", flat=True))
+            missing = sorted(ids - found)
+            if missing:
+                return Response({"detail": f"Payments not found in this plan: {missing}"}, status=404)
+            deleted, _ = payments.delete()
+        return Response({"deleted": deleted})
 
 
 class DuplicateCheckView(APIView):

@@ -387,3 +387,38 @@ class DuplicateReceiptTests(APITestCase):
         import_module("ledger.migrations.0005_backfill_payment_reference").backfill(apps, None)
         p.refresh_from_db()
         self.assertEqual(p.reference, "100441")
+
+
+class BulkTests(APITestCase):
+    def setUp(self):
+        res = self.client.post("/api/auth/register/", {"email": "bulk@example.com", "password": "Sup3r-secret!"}, format="json")
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {res.data['access']}")
+        body = {"purchase_price": "1199", "total_amount": "1350", "months": 18, "first_payment_date": "2026-08-01",
+                "payment_currency": "PKR", "exchange_rate": "277"}
+        self.plan = self.client.post("/api/plans/", {"item": "MacBook", **body}, format="json").data
+        self.other = self.client.post("/api/plans/", {"item": "iPhone", **body}, format="json").data
+
+    def pay(self, plan, ref):
+        res = self.client.post(f"/api/plans/{plan['id']}/payments/",
+                               {"sent_amount": "1000", "paid_on": "2026-09-01", "reference": ref}, format="json")
+        self.assertEqual(res.status_code, 201, res.data)
+        return res.data["id"]
+
+    def test_bulk_delete(self):
+        a, b, c = (self.pay(self.plan, r) for r in ("R1", "R2", "R3"))
+        res = self.client.post(f"/api/plans/{self.plan['id']}/payments/bulk-delete/", {"ids": [a, b]}, format="json")
+        self.assertEqual(res.data, {"deleted": 2})
+        self.assertEqual([p["id"] for p in self.client.get(f"/api/plans/{self.plan['id']}/").data["payments"]], [c])
+
+    def test_bulk_delete_is_all_or_nothing(self):
+        mine = self.pay(self.plan, "R1")
+        theirs = self.pay(self.other, "R2")  # another plan's payment
+        res = self.client.post(f"/api/plans/{self.plan['id']}/payments/bulk-delete/", {"ids": [mine, theirs]}, format="json")
+        self.assertEqual(res.status_code, 404)
+        self.assertEqual(len(self.client.get(f"/api/plans/{self.plan['id']}/").data["payments"]), 1)
+
+    def test_bulk_delete_validates_input(self):
+        url = f"/api/plans/{self.plan['id']}/payments/bulk-delete/"
+        self.assertEqual(self.client.post(url, {"ids": []}, format="json").status_code, 400)
+        self.assertEqual(self.client.post(url, {"ids": ["x"]}, format="json").status_code, 400)
+        self.assertEqual(self.client.post(url, {}, format="json").status_code, 400)
