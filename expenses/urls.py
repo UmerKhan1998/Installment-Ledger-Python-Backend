@@ -19,6 +19,8 @@ from .views import (
     ExpenseSettingsView,
     ExpenseSummaryView,
     MonthRatesView,
+    RateHistoryView,
+    RateRefreshView,
 )
 
 urlpatterns = [
@@ -27,6 +29,8 @@ urlpatterns = [
     path("summary/", ExpenseSummaryView.as_view(), name="expense-summary"),
     path("settings/", ExpenseSettingsView.as_view(), name="expense-settings"),
     path("rates/", MonthRatesView.as_view(), name="expense-rates"),
+    path("rates/history/", RateHistoryView.as_view(), name="expense-rate-history"),
+    path("rates/refresh/", RateRefreshView.as_view(), name="expense-rate-refresh"),
     path("budget/", BudgetView.as_view(), name="expense-budget"),
     path("categories/", CategoriesView.as_view(), name="expense-categories"),
     path("bulk-delete/", ExpenseBulkDeleteView.as_view(), name="expense-bulk-delete"),

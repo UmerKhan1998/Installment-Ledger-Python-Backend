@@ -13,7 +13,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from ledger.views import market_rate
+from ledger.rates import market_rate, user_rate_settings
 
 from .models import MonthlyRate
 
@@ -37,6 +37,8 @@ class Converter:
         self.display = display
         self._cache = {}
         self.today = date.today()
+        # The user's chosen provider (Profile → Exchange rates) serves every new market lookup.
+        self.provider, self.fallback = user_rate_settings(user)
 
     def _market_date(self, first):
         """Past month: its last day. Current or future month: today (latest rate)."""
@@ -60,7 +62,7 @@ class Converter:
         # market's own date can lag a day). Past months and manual rates are never refetched.
         stale = row and row.source == "market" and current and row.updated_at.date() < self.today
         if row is None or stale:
-            found = market_rate(base, quote, self._market_date(first))
+            found = market_rate(base, quote, self._market_date(first), provider=self.provider, fallback=self.fallback)
             if found:
                 row = self._store(first, base, quote, found, row)
         self._cache[key] = row
@@ -71,6 +73,7 @@ class Converter:
             "rate": Decimal(found["rate"]).quantize(RATE_PLACES, rounding=ROUND_HALF_UP),
             "source": "market",
             "as_of": date.fromisoformat(str(found["date"])[:10]) if found.get("date") else self.today,
+            "provider": found.get("provider") or "",
         }
         if existing is not None:
             # Only replace a market rate; a manual rate set meanwhile wins.
@@ -101,4 +104,21 @@ def rate_payload(row):
         "rate": f"{row.rate:.8f}".rstrip("0").rstrip("."),
         "source": row.source,
         "as_of": row.as_of.isoformat() if row.as_of else None,
+        "provider": row.provider or None,
     }
+
+
+def refresh_market_rate(conv, row):
+    """Re-fetch one stored *market* rate from the user's current provider. Returns (old_rate, row) or None.
+
+    Manual rates are never touched. Past months use the month's last day, the current month the latest rate.
+    """
+    if row.source != "market":
+        return None
+    found = market_rate(row.base, row.quote, conv._market_date(row.month), provider=conv.provider, fallback=conv.fallback)
+    if not found:
+        return None
+    old = row.rate
+    conv._store(row.month, row.base, row.quote, found, row)
+    row.refresh_from_db()
+    return old, row

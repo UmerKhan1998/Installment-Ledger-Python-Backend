@@ -101,10 +101,10 @@ class ExpenseTests(APITestCase):
 
 def fake_market(rates):
     """market_rate stand-in: rates = {(base, quote, iso_date_or_None): Decimal-ish}."""
-    def lookup(base, quote, wanted=None):
+    def lookup(base, quote, wanted=None, **kwargs):
         key = (base, quote, wanted.isoformat() if wanted else None)
         if key in rates:
-            return {"rate": rates[key], "date": key[2] or "2026-11-24", "source": "test"}
+            return {"rate": rates[key], "date": key[2] or "2026-11-24", "source": "test", "provider": kwargs.get("provider") or "currency_api"}
         return None
     return lookup
 
@@ -148,7 +148,7 @@ class ConversionTests(APITestCase):
         s = self.summary()
         self.assertEqual(s["total"], "60737.31")  # 40000 + 75 x 276.4974 = 20737.305 -> 20737.31
         self.assertEqual(s["count"], 2)
-        self.assertEqual(s["rates"], [{"currency": "USD", "quote": "PKR", "rate": "276.4974", "source": "market", "as_of": "2026-11-24"}])
+        self.assertEqual(s["rates"], [{"currency": "USD", "quote": "PKR", "rate": "276.4974", "source": "market", "as_of": "2026-11-24", "provider": "currency_api"}])
         self.assertEqual(s["unconverted"], [])
 
     def test_rows_add_up_to_total(self):
@@ -204,6 +204,7 @@ class ConversionTests(APITestCase):
         self.add(amount="75", currency="USD")
         res = self.client.put("/api/expenses/rates/", {"month": "2026-11", "currency": "USD", "rate": "280"}, format="json")
         self.assertEqual(res.data["source"], "manual")
+        self.assertIsNone(res.data["provider"])  # your own rate names no provider
         self.assertEqual(self.summary()["total"], "21000.00")
         # The daily market refresh never overwrites a manual rate.
         self.assertEqual(self.summary()["rates"][0]["rate"], "280")
@@ -246,7 +247,7 @@ class RateStorageTests(APITestCase):
     def test_current_month_rate_is_fetched_once_a_day_even_if_market_date_lags(self):
         from .conversion import Converter
         calls = []
-        def lagging(base, quote, wanted=None):
+        def lagging(base, quote, wanted=None, **kwargs):
             calls.append(1)
             return {"rate": "276.38", "date": "2026-11-23", "source": "test"}  # one day behind "today"
         with mock.patch("expenses.conversion.market_rate", side_effect=lagging), \
@@ -556,3 +557,59 @@ class ProjectTests(APITestCase):
         self.assertEqual(self.client.get(f"/api/expenses/projects/{pid}/").status_code, 404)
         self.assertEqual(self.client.post(f"/api/expenses/projects/{pid}/expenses/", {"title": "x", "amount": "1", "spent_on": "2026-11-01"}, format="json").status_code, 404)
         self.assertEqual(self.client.get("/api/expenses/projects/").data, [])
+
+
+
+class RateProviderExpenseTests(APITestCase):
+    """Expense conversion uses the user's provider; stored market rates can be refreshed; manual ones can't."""
+
+    def setUp(self):
+        res = self.client.post("/api/auth/register/", {"email": "rp@exp.com", "password": "Sup3r-secret!"}, format="json")
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {res.data['access']}")
+        self.calls = []
+        self.answer = {"currency_api": "276.50", "fxratesapi": "276.90"}
+
+        def market(base, quote, wanted=None, provider=None, fallback=True):
+            self.calls.append(provider)
+            return {"rate": self.answer[provider], "date": "2026-10-31", "source": provider, "provider": provider}
+
+        patcher = mock.patch("expenses.conversion.market_rate", side_effect=market)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def add(self, **kw):
+        body = {"title": "x", "amount": "100", "currency": "USD", "category": "bills", "spent_on": "2026-10-05", **kw}
+        self.assertEqual(self.client.post("/api/expenses/", body, format="json").status_code, 201)
+
+    def test_conversion_uses_chosen_provider_and_records_it(self):
+        self.client.patch("/api/rates/settings/", {"provider": "fxratesapi"}, format="json")
+        self.add()
+        s = self.client.get("/api/expenses/summary/?month=2026-10").data
+        self.assertEqual(s["total"], "27690.00")
+        self.assertEqual(s["rates"][0]["provider"], "fxratesapi")
+
+    def test_refresh_refetches_market_rates_with_new_provider_only(self):
+        self.add()
+        self.add(spent_on="2026-09-05")
+        self.client.put("/api/expenses/rates/", {"month": "2026-09", "currency": "USD", "rate": "300"}, format="json")
+        self.assertEqual(self.client.get("/api/expenses/summary/?month=2026-10").data["total"], "27650.00")
+        self.client.patch("/api/rates/settings/", {"provider": "fxratesapi"}, format="json")
+        # Switching provider alone doesn't touch stored rates (figures stay put)...
+        self.assertEqual(self.client.get("/api/expenses/summary/?month=2026-10").data["total"], "27650.00")
+        # ...until a refresh.
+        res = self.client.post("/api/expenses/rates/refresh/", {}, format="json").data
+        self.assertEqual([(c["month"], c["old"], c["rate"], c["provider"]) for c in res["changed"]], [("2026-10", "276.5", "276.9", "fxratesapi")])
+        self.assertEqual(self.client.get("/api/expenses/summary/?month=2026-10").data["total"], "27690.00")
+        self.assertEqual(self.client.get("/api/expenses/summary/?month=2026-09").data["total"], "30000.00")  # manual kept
+
+    def test_refresh_one_month_and_history(self):
+        self.add()
+        self.add(spent_on="2026-09-05")
+        self.client.get("/api/expenses/summary/?month=2026-09")
+        self.client.patch("/api/rates/settings/", {"provider": "fxratesapi"}, format="json")
+        res = self.client.post("/api/expenses/rates/refresh/", {"month": "2026-09"}, format="json").data
+        self.assertEqual([c["month"] for c in res["changed"]], ["2026-09"])
+        hist = self.client.get("/api/expenses/rates/history/?months=24").data["months"]
+        by_month = {m["month"]: m["rates"][0] for m in hist}
+        self.assertEqual(by_month["2026-09"]["provider"], "fxratesapi")
+        self.assertEqual(by_month["2026-10"]["provider"], "currency_api")

@@ -1,9 +1,6 @@
-import json
-import urllib.request
-from datetime import date, timedelta
+from datetime import date
 from decimal import Decimal
 
-from django.core.cache import cache
 
 from django.db import transaction
 from django.db.models import Prefetch
@@ -14,7 +11,8 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .duplicates import describe, find_duplicate, normalize_hash, normalize_reference
-from .models import CURRENCY_CHOICES, Payment, Plan
+from .models import Payment, Plan, RateSettings
+from .rates import PROVIDERS, SUPPORTED, market_rate, market_rate_for, user_rate_settings
 from .schedule import plan_figures
 from .serializers import PaymentSerializer, PlanSerializer
 
@@ -193,74 +191,6 @@ class SummaryView(APIView):
         )
 
 
-SUPPORTED = {code for code, _ in CURRENCY_CHOICES}
-
-# Daily rates (incl. PKR) by date, from 2024-03 onwards; two mirrors of the same dataset.
-DATED_SOURCES = [
-    "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@{tag}/v1/currencies/{base}.min.json",
-    "https://{tag}.currency-api.pages.dev/v1/currencies/{base}.min.json",
-]
-LATEST_FALLBACK = "https://open.er-api.com/v6/latest/{base}"
-HISTORY_START = date(2024, 3, 2)
-LOOKBACK_DAYS = 5  # a missing day falls back to the closest earlier published day
-
-
-def _fetch_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "installment-ledger/1.0"})
-    with urllib.request.urlopen(req, timeout=6) as res:
-        return json.load(res)
-
-
-def _dated_rate(base, quote, tag):
-    """Rate for one day (tag = 'YYYY-MM-DD' or 'latest'), or None if not published."""
-    key = f"fx:{base}:{quote}:{tag}"
-    cached = cache.get(key)
-    if cached:
-        return cached
-    for template in DATED_SOURCES:
-        try:
-            data = _fetch_json(template.format(tag=tag, base=base.lower()))
-            value = data[base.lower()][quote.lower()]
-        except Exception:
-            continue
-        result = {"rate": Decimal(str(value)), "date": data.get("date", tag), "source": "fawazahmed0/currency-api"}
-        cache.set(key, result, 60 * 60 if tag == "latest" else 60 * 60 * 24 * 30)
-        return result
-    return None
-
-
-def _latest_rate(base, quote):
-    result = _dated_rate(base, quote, "latest")
-    if result:
-        return result
-    try:
-        data = _fetch_json(LATEST_FALLBACK.format(base=base))
-        value = data["rates"][quote]
-    except Exception:
-        return None
-    return {"rate": Decimal(str(value)), "date": date.today().isoformat(), "source": "open.er-api.com"}
-
-
-def market_rate(base, quote, wanted=None):
-    """Market rate {rate, date, source} for `wanted` (a date), or None if unavailable.
-
-    No date, today or a future date -> latest. A past date -> that day, else the closest earlier
-    published day (up to LOOKBACK_DAYS back). Dates before HISTORY_START have no data.
-    """
-    if base == quote:
-        return {"rate": Decimal("1"), "date": (wanted or date.today()).isoformat(), "source": None}
-    today = date.today()
-    if wanted is None or wanted >= today:
-        return _latest_rate(base, quote)
-    if wanted < HISTORY_START:
-        return None
-    for back in range(LOOKBACK_DAYS + 1):
-        result = _dated_rate(base, quote, (wanted - timedelta(days=back)).isoformat())
-        if result:
-            return result
-    return None
-
-
 class LiveRateView(APIView):
     """GET /api/rates/?base=USD&quote=PKR[&date=YYYY-MM-DD] -> market rate for that day.
 
@@ -282,14 +212,16 @@ class LiveRateView(APIView):
         except ValueError:
             return Response({"detail": "date must be YYYY-MM-DD."}, status=400)
 
-        if wanted is not None and wanted < HISTORY_START:
-            return Response(
-                {"detail": f"No market rates before {HISTORY_START:%b %d, %Y}. Enter the rate manually."}, status=404
-            )
-        result = market_rate(base, quote, wanted)
+        result = market_rate_for(request.user, base, quote, wanted)
 
         if not result:
-            return Response({"detail": "Market rate is unavailable right now. Enter the rate manually."}, status=503)
+            provider, _ = user_rate_settings(request.user)
+            name = PROVIDERS[provider].name if provider in PROVIDERS else "the provider"
+            return Response(
+                {"detail": f"No market rate from {name} for {base}→{quote}{' on ' + wanted.isoformat() if wanted else ''}. "
+                           "Enter the rate manually, or pick another provider in Profile → Exchange rates."},
+                status=404 if wanted else 503,
+            )
         return Response(
             {
                 "base": base,
@@ -298,5 +230,63 @@ class LiveRateView(APIView):
                 "date": result["date"],
                 "requested_date": wanted.isoformat() if wanted else None,
                 "source": result["source"],
+                "provider": result["provider"],
             }
         )
+
+
+class RateProvidersView(APIView):
+    """GET /api/rates/providers/ -> available providers, with the user's choice."""
+
+    def get(self, request):
+        provider, fallback = user_rate_settings(request.user)
+        return Response({"selected": provider, "fallback": fallback, "providers": [p.info() for p in PROVIDERS.values()]})
+
+
+class RateSettingsView(APIView):
+    """GET / PATCH /api/rates/settings/ {"provider": "fxratesapi", "fallback": true}"""
+
+    def get(self, request):
+        provider, fallback = user_rate_settings(request.user)
+        return Response({"provider": provider, "fallback": fallback})
+
+    def patch(self, request):
+        prefs, _ = RateSettings.objects.get_or_create(user=request.user)
+        if "provider" in request.data:
+            if request.data["provider"] not in PROVIDERS:
+                return Response({"provider": [f"Use one of: {', '.join(PROVIDERS)}."]}, status=400)
+            prefs.provider = request.data["provider"]
+        if "fallback" in request.data:
+            prefs.fallback = bool(request.data["fallback"])
+        prefs.save()
+        return Response({"provider": prefs.provider, "fallback": prefs.fallback})
+
+
+class RateTestView(APIView):
+    """GET /api/rates/test/?provider=fxratesapi&base=USD&quote=PKR[&date=YYYY-MM-DD]
+
+    Asks one provider directly (no fallback), for the Profile page's "Test" button.
+    """
+
+    def get(self, request):
+        key = request.query_params.get("provider", "")
+        base = request.query_params.get("base", "USD").upper()
+        quote = request.query_params.get("quote", "PKR").upper()
+        if key not in PROVIDERS:
+            return Response({"detail": "Unknown provider."}, status=400)
+        if base not in SUPPORTED or quote not in SUPPORTED:
+            return Response({"detail": "Unsupported currency."}, status=400)
+        raw = request.query_params.get("date")
+        try:
+            wanted = date.fromisoformat(raw) if raw else None
+        except ValueError:
+            return Response({"detail": "date must be YYYY-MM-DD."}, status=400)
+        provider = PROVIDERS[key]
+        if not provider.supports(base, quote):
+            return Response({"ok": False, "detail": f"{provider.name} doesn't cover {base}→{quote}."})
+        found = market_rate(base, quote, wanted, provider=key, fallback=False)
+        if not found:
+            return Response({"ok": False, "detail": f"{provider.name} returned no rate for {base}→{quote}"
+                                                    f"{' on ' + wanted.isoformat() if wanted else ''}."})
+        return Response({"ok": True, "base": base, "quote": quote, "rate": f"{found['rate']:.8f}".rstrip("0").rstrip("."),
+                         "date": found["date"], "provider": key})

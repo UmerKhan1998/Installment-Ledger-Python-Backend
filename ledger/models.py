@@ -80,3 +80,15 @@ class Payment(models.Model):
 
     def __str__(self):
         return f"{self.amount} on {self.paid_on}"
+
+
+class RateSettings(models.Model):
+    """Which exchange-rate provider this user's lookups use (see ledger/rates.py)."""
+
+    user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="rate_settings")
+    provider = models.CharField(max_length=30, default="currency_api")
+    fallback = models.BooleanField(default=True, help_text="Try the other providers when the chosen one can't answer")
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.user} · {self.provider}"

@@ -214,45 +214,95 @@ class CurrencyExchangeTests(APITestCase):
         self.assertEqual(self.client.get(f"/api/plans/{pid}/").data["exchange_rate"], "280.0000")
 
 
+def fake_providers(answers):
+    """Patch every provider's fetch: answers = {(provider_key, tag): "rate"}; anything else -> None."""
+    from contextlib import ExitStack
+    from unittest import mock
+
+    from .rates import PROVIDERS
+
+    stack = ExitStack()
+    for key, provider in PROVIDERS.items():
+        def fetch(base, quote, tag, _key=key):
+            value = answers.get((_key, tag))
+            return {"rate": Decimal(value), "date": tag if tag != "latest" else "2026-11-22"} if value else None
+        stack.enter_context(mock.patch.object(provider, "fetch", side_effect=fetch))
+    return stack
+
+
 class DatedRateTests(APITestCase):
-    """/api/rates/ picks the rate for the payment date (network mocked)."""
+    """/api/rates/ picks the rate for the payment date from the user's provider (network mocked)."""
 
     def setUp(self):
+        from django.core.cache import cache
+        cache.clear()
         res = self.client.post("/api/auth/register/", {"email": "r@example.com", "password": "Sup3r-secret!"}, format="json")
         self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {res.data['access']}")
 
-    def fake_source(self, published):
-        def fake(base, quote, tag):
-            if tag in published:
-                return {"rate": Decimal(published[tag]), "date": tag if tag != "latest" else "2026-11-22", "source": "test"}
-            return None
-        return fake
-
     def test_past_date_uses_that_days_rate(self):
-        from unittest import mock
-        with mock.patch("ledger.views._dated_rate", self.fake_source({"2026-06-15": "278.2685"})):
+        with fake_providers({("currency_api", "2026-06-15"): "278.2685"}):
             res = self.client.get("/api/rates/?base=USD&quote=PKR&date=2026-06-15")
         self.assertEqual(res.status_code, 200)
-        self.assertEqual(res.data["rate"], "278.2685")
-        self.assertEqual(res.data["date"], "2026-06-15")
+        self.assertEqual((res.data["rate"], res.data["date"], res.data["provider"]), ("278.2685", "2026-06-15", "currency_api"))
 
     def test_missing_day_falls_back_to_earlier_day(self):
-        from unittest import mock
-        with mock.patch("ledger.views._dated_rate", self.fake_source({"2026-06-13": "279.0000"})):
+        with fake_providers({("currency_api", "2026-06-13"): "279.0000"}):
             res = self.client.get("/api/rates/?base=USD&quote=PKR&date=2026-06-15")
         self.assertEqual(res.data["date"], "2026-06-13")
 
     def test_future_date_uses_latest(self):
-        from unittest import mock
-        with mock.patch("ledger.views._dated_rate", self.fake_source({"latest": "276.4819"})):
+        with fake_providers({("currency_api", "latest"): "276.4819"}):
             res = self.client.get("/api/rates/?base=USD&quote=PKR&date=2099-01-01")
         self.assertEqual(res.data["rate"], "276.4819")
 
-    def test_before_history_is_404(self):
-        self.assertEqual(self.client.get("/api/rates/?base=USD&quote=PKR&date=2019-05-24").status_code, 404)
+    def test_no_provider_has_it_is_404(self):
+        with fake_providers({}):
+            res = self.client.get("/api/rates/?base=USD&quote=PKR&date=2019-05-24")
+        self.assertEqual(res.status_code, 404)
+        self.assertIn("Profile", res.data["detail"])
 
     def test_bad_date_is_400(self):
         self.assertEqual(self.client.get("/api/rates/?base=USD&quote=PKR&date=yesterday").status_code, 400)
+
+    def test_chosen_provider_is_used(self):
+        self.client.patch("/api/rates/settings/", {"provider": "fxratesapi"}, format="json")
+        with fake_providers({("currency_api", "2026-06-15"): "278.00", ("fxratesapi", "2026-06-15"): "278.50"}):
+            res = self.client.get("/api/rates/?base=USD&quote=PKR&date=2026-06-15")
+        self.assertEqual((res.data["rate"], res.data["provider"]), ("278.5000", "fxratesapi"))
+
+    def test_fallback_when_provider_lacks_the_currency(self):
+        self.client.patch("/api/rates/settings/", {"provider": "frankfurter"}, format="json")  # no PKR
+        with fake_providers({("currency_api", "2026-06-15"): "278.00"}):
+            res = self.client.get("/api/rates/?base=USD&quote=PKR&date=2026-06-15")
+        self.assertEqual(res.data["provider"], "currency_api")
+        self.client.patch("/api/rates/settings/", {"fallback": False}, format="json")
+        with fake_providers({("currency_api", "2026-06-15"): "278.00"}):
+            self.assertEqual(self.client.get("/api/rates/?base=USD&quote=PKR&date=2026-06-15").status_code, 404)
+
+    def test_history_older_than_a_provider_falls_back(self):
+        # Currency API starts in March 2024; FXRatesAPI goes further back.
+        with fake_providers({("fxratesapi", "2024-01-15"): "280.71"}):
+            res = self.client.get("/api/rates/?base=USD&quote=PKR&date=2024-01-15")
+        self.assertEqual((res.data["rate"], res.data["provider"]), ("280.7100", "fxratesapi"))
+
+    def test_settings_and_providers(self):
+        self.assertEqual(self.client.get("/api/rates/settings/").data, {"provider": "currency_api", "fallback": True})
+        self.assertEqual(self.client.patch("/api/rates/settings/", {"provider": "nope"}, format="json").status_code, 400)
+        info = self.client.get("/api/rates/providers/").data
+        self.assertEqual(info["selected"], "currency_api")
+        frank = next(p for p in info["providers"] if p["key"] == "frankfurter")
+        self.assertIn("PKR", frank["missing_currencies"])
+        latest_only = next(p for p in info["providers"] if p["key"] == "open_er_api")
+        self.assertIsNone(latest_only["history_from"])
+
+    def test_test_endpoint_asks_one_provider_only(self):
+        with fake_providers({("fxratesapi", "latest"): "276.35"}):
+            ok = self.client.get("/api/rates/test/?provider=fxratesapi&base=USD&quote=PKR").data
+            not_there = self.client.get("/api/rates/test/?provider=currency_api&base=USD&quote=PKR").data
+            unsupported = self.client.get("/api/rates/test/?provider=frankfurter&base=USD&quote=PKR").data
+        self.assertEqual((ok["ok"], ok["rate"]), (True, "276.35"))
+        self.assertFalse(not_there["ok"])  # no fallback in a test
+        self.assertIn("doesn't cover", unsupported["detail"])
 
 
 class ReceiptTests(APITestCase):

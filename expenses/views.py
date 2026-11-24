@@ -14,7 +14,7 @@ from django.db.models import Prefetch
 
 from ledger.models import CURRENCY_CHOICES, Payment, Plan
 
-from .conversion import Converter, rate_payload, to_cents
+from .conversion import Converter, rate_payload, refresh_market_rate, to_cents
 from .plans import INSTALLMENTS, INSTALLMENTS_LABEL, due_in_month, linked_payments, linked_plan_ids
 from .budget import global_version, resolve, version_payload
 from .models import CATEGORY_CHOICES, Expense, ExpenseSettings, GlobalBudget, MonthBudget, MonthlyRate
@@ -398,7 +398,7 @@ class MonthRatesView(APIView):
             raise ValidationError({"rate": "The rate must be more than 0."})
         row, _ = MonthlyRate.objects.update_or_create(
             user=request.user, month=first, base=code, quote=cur,
-            defaults={"rate": rate.quantize(Decimal("0.00000001")), "source": "manual", "as_of": None},
+            defaults={"rate": rate.quantize(Decimal("0.00000001")), "source": "manual", "as_of": None, "provider": ""},
         )
         return Response(rate_payload(row))
 
@@ -438,6 +438,50 @@ class CopyRecurringView(APIView):
                     spent_on=first.replace(day=min(old.spent_on.day, last_day)),
                 ))
         return Response(ExpenseSerializer(created, many=True).data, status=status.HTTP_201_CREATED)
+
+
+class RateHistoryView(APIView):
+    """GET /api/expenses/rates/history/?months=12 -> stored monthly rates (newest month first), any pair."""
+
+    def get(self, request):
+        try:
+            months = max(1, min(int(request.query_params.get("months", 12)), 60))
+        except ValueError:
+            months = 12
+        since = shift_month(date.today().replace(day=1), -(months - 1))
+        rows = MonthlyRate.objects.filter(user=request.user, month__gte=since).order_by("-month", "base", "quote")
+        grouped = {}
+        for r in rows:
+            grouped.setdefault(r.month.strftime("%Y-%m"), []).append({**rate_payload(r), "updated_at": r.updated_at.isoformat()})
+        return Response({"months": [{"month": m, "rates": v} for m, v in grouped.items()]})
+
+
+class RateRefreshView(APIView):
+    """POST /api/expenses/rates/refresh/ {"month": "2026-10"} (or no month = every stored month)
+
+    Re-fetches stored *market* rates from the user's current provider; manual rates stay as they are.
+    Returns what changed. Expense totals use the new rates straight away.
+    """
+
+    def post(self, request):
+        qs = MonthlyRate.objects.filter(user=request.user, source="market")
+        if request.data.get("month"):
+            qs = qs.filter(month=parse_month(request.data.get("month")))
+        convs = {}
+        changed, unchanged, failed = [], 0, []
+        for row in qs.order_by("-month"):
+            conv = convs.setdefault(row.quote, Converter(request.user, row.quote))
+            result = refresh_market_rate(conv, row)
+            if result is None:
+                failed.append(f"{row.month:%Y-%m} {row.base}→{row.quote}")
+                continue
+            old, fresh = result
+            if old != fresh.rate:
+                changed.append({"month": fresh.month.strftime("%Y-%m"), "pair": f"{fresh.base}→{fresh.quote}",
+                                "old": f"{old:.8f}".rstrip("0").rstrip("."), **rate_payload(fresh)})
+            else:
+                unchanged += 1
+        return Response({"changed": changed, "unchanged": unchanged, "failed": failed})
 
 
 class CategoriesView(APIView):

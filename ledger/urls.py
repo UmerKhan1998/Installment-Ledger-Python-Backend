@@ -3,6 +3,9 @@ from django.urls import path
 from .views import (
     DuplicateCheckView,
     LiveRateView,
+    RateProvidersView,
+    RateSettingsView,
+    RateTestView,
     PaymentBulkDeleteView,
     PaymentDetailView,
     PaymentListCreateView,
@@ -15,6 +18,9 @@ from .views import (
 urlpatterns = [
     path("summary/", SummaryView.as_view(), name="summary"),
     path("rates/", LiveRateView.as_view(), name="rates"),
+    path("rates/providers/", RateProvidersView.as_view(), name="rate-providers"),
+    path("rates/settings/", RateSettingsView.as_view(), name="rate-settings"),
+    path("rates/test/", RateTestView.as_view(), name="rate-test"),
     path("payments/duplicate-check/", DuplicateCheckView.as_view(), name="duplicate-check"),
     path("plans/", PlanListCreateView.as_view(), name="plan-list"),
     path("plans/<int:pk>/", PlanDetailView.as_view(), name="plan-detail"),

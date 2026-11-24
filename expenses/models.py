@@ -72,6 +72,7 @@ class MonthlyRate(models.Model):
     rate = models.DecimalField(max_digits=24, decimal_places=8, validators=[MinValueValidator(Decimal("0.00000001"))])
     source = models.CharField(max_length=10, choices=SOURCE_CHOICES, default="market")
     as_of = models.DateField(null=True, blank=True, help_text="Market date the rate is from")
+    provider = models.CharField(max_length=30, blank=True, help_text="Rate provider that served a market rate")
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
