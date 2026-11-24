@@ -241,6 +241,26 @@ def _latest_rate(base, quote):
     return {"rate": Decimal(str(value)), "date": date.today().isoformat(), "source": "open.er-api.com"}
 
 
+def market_rate(base, quote, wanted=None):
+    """Market rate {rate, date, source} for `wanted` (a date), or None if unavailable.
+
+    No date, today or a future date -> latest. A past date -> that day, else the closest earlier
+    published day (up to LOOKBACK_DAYS back). Dates before HISTORY_START have no data.
+    """
+    if base == quote:
+        return {"rate": Decimal("1"), "date": (wanted or date.today()).isoformat(), "source": None}
+    today = date.today()
+    if wanted is None or wanted >= today:
+        return _latest_rate(base, quote)
+    if wanted < HISTORY_START:
+        return None
+    for back in range(LOOKBACK_DAYS + 1):
+        result = _dated_rate(base, quote, (wanted - timedelta(days=back)).isoformat())
+        if result:
+            return result
+    return None
+
+
 class LiveRateView(APIView):
     """GET /api/rates/?base=USD&quote=PKR[&date=YYYY-MM-DD] -> market rate for that day.
 
@@ -262,19 +282,11 @@ class LiveRateView(APIView):
         except ValueError:
             return Response({"detail": "date must be YYYY-MM-DD."}, status=400)
 
-        today = date.today()
-        if wanted is None or wanted >= today:
-            result = _latest_rate(base, quote)
-        elif wanted < HISTORY_START:
+        if wanted is not None and wanted < HISTORY_START:
             return Response(
                 {"detail": f"No market rates before {HISTORY_START:%b %d, %Y}. Enter the rate manually."}, status=404
             )
-        else:
-            result = None
-            for back in range(LOOKBACK_DAYS + 1):
-                result = _dated_rate(base, quote, (wanted - timedelta(days=back)).isoformat())
-                if result:
-                    break
+        result = market_rate(base, quote, wanted)
 
         if not result:
             return Response({"detail": "Market rate is unavailable right now. Enter the rate manually."}, status=503)

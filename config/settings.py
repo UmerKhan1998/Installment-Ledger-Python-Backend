@@ -43,6 +43,7 @@ INSTALLED_APPS = [
     "corsheaders",
     "accounts",
     "ledger",
+    "expenses",
 ]
 
 MIDDLEWARE = [
@@ -95,7 +96,7 @@ def postgres_from_url(url):
 
 # DATABASE_URL (e.g. Neon) wins; otherwise the POSTGRES_* vars. USE_SQLITE=1 is only for quick local tests.
 if env_bool("USE_SQLITE"):
-    DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": BASE_DIR / "db.sqlite3"}}
+    DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": BASE_DIR / "db.sqlite3", "OPTIONS": {"timeout": 20}}}
 elif os.getenv("DATABASE_URL"):
     DATABASES = {"default": postgres_from_url(os.environ["DATABASE_URL"])}
 elif ON_RENDER:
