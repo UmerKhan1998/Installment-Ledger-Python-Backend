@@ -10,9 +10,12 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from ledger.models import CURRENCY_CHOICES
+from django.db.models import Prefetch
+
+from ledger.models import CURRENCY_CHOICES, Payment, Plan
 
 from .conversion import Converter, rate_payload, to_cents
+from .plans import INSTALLMENTS, INSTALLMENTS_LABEL, due_in_month, linked_payments, linked_plan_ids
 from .models import CATEGORY_CHOICES, Expense, ExpenseSettings, MonthlyRate
 from .serializers import ExpenseSerializer, ExpenseSettingsSerializer
 
@@ -143,24 +146,39 @@ class ExpenseSummaryView(APIView):
         mine = Expense.objects.filter(user=request.user)
 
         # This month, row by row (each rounded to the cent, so the list adds up to the total).
-        labels = dict(CATEGORY_CHOICES)
+        # Rows are the user's expenses plus payments of linked installment plans.
+        labels = {**dict(CATEGORY_CHOICES), INSTALLMENTS: INSTALLMENTS_LABEL}
+        plan_ids = linked_plan_ids(request.user, prefs)
+        plan_rows = linked_payments(request.user, plan_ids, start, end)
+        items = [
+            (e.amount, e.currency, e.category, None)
+            for e in mine.filter(spent_on__gte=start, spent_on__lt=end).only("amount", "currency", "category")
+        ] + [(r["amount"], r["currency"], INSTALLMENTS, r) for r in plan_rows]
         total = Decimal("0")
         count = 0
         cats = {}
         unconverted = {}
         rates_used = {}
-        for e in mine.filter(spent_on__gte=start, spent_on__lt=end).only("amount", "currency", "category"):
-            value, rate_row = conv.convert(e.amount, e.currency, first)
+        plan_paid = {}
+        for amount, currency, category, plan_row in items:
+            value, rate_row = conv.convert(amount, currency, first)
+            if plan_row is not None:
+                plan_row["converted"] = None if currency == cur else (
+                    {"currency": cur, "amount": money(value), "rate": f"{rate_row.rate:.8f}".rstrip("0").rstrip("."),
+                     "source": rate_row.source} if value is not None else {"currency": cur, "amount": None, "rate": None, "source": None}
+                )
             if value is None:
-                u = unconverted.setdefault(e.currency, {"currency": e.currency, "total": Decimal("0"), "count": 0})
-                u["total"] += e.amount
+                u = unconverted.setdefault(currency, {"currency": currency, "total": Decimal("0"), "count": 0})
+                u["total"] += amount
                 u["count"] += 1
                 continue
             if rate_row:
                 rates_used[rate_row.base] = rate_row
             total += value
             count += 1
-            c = cats.setdefault(e.category, {"total": Decimal("0"), "count": 0, "foreign": 0})
+            if plan_row is not None:
+                plan_paid[plan_row["plan_id"]] = plan_paid.get(plan_row["plan_id"], Decimal("0")) + value
+            c = cats.setdefault(category, {"total": Decimal("0"), "count": 0, "foreign": 0})
             c["total"] += value
             c["count"] += 1
             c["foreign"] += 1 if rate_row else 0
@@ -174,9 +192,9 @@ class ExpenseSummaryView(APIView):
         # Trend: same rule for each of the last months, each with its own monthly rate.
         trend_start = shift_month(first, -(TREND_MONTHS - 1))
         per_month = {}
-        for amount, currency, spent_on in mine.filter(spent_on__gte=trend_start, spent_on__lt=end).values_list(
-            "amount", "currency", "spent_on"
-        ):
+        trend_rows = list(mine.filter(spent_on__gte=trend_start, spent_on__lt=end).values_list("amount", "currency", "spent_on"))
+        trend_rows += [(r["amount"], r["currency"], r["spent_on"]) for r in linked_payments(request.user, plan_ids, trend_start, end)]
+        for amount, currency, spent_on in trend_rows:
             m = spent_on.replace(day=1)
             value, _ = conv.convert(amount, currency, m)
             if value is not None:
@@ -223,7 +241,37 @@ class ExpenseSummaryView(APIView):
             "unconverted": [{**u, "total": money(u["total"])} for u in unconverted.values()],
             "trend": trend,
             "recurring_pending": recurring_pending,
+            "linked_plans": self._linked_plans(request.user, plan_ids, conv, first, start, end, plan_paid),
+            "plan_payments": [
+                {**{k: v for k, v in r.items() if k not in ("amount", "spent_on", "paid_time")},
+                 "amount": money(r["amount"]), "spent_on": r["spent_on"].isoformat(),
+                 "paid_time": r["paid_time"].strftime("%H:%M") if r["paid_time"] else None,
+                 "category": INSTALLMENTS, "category_label": INSTALLMENTS_LABEL}
+                for r in plan_rows
+            ],
         })
+
+    @staticmethod
+    def _linked_plans(user, plan_ids, conv, first, start, end, plan_paid):
+        """One card per linked plan: paid this month (tracker currency) and what is due this month."""
+        cards = []
+        for plan in Plan.objects.filter(id__in=plan_ids, user=user).prefetch_related(
+            Prefetch("payments", queryset=Payment.objects.defer("receipt_data"))
+        ).order_by("item"):
+            due = due_in_month(plan, start, end)
+            left_conv, _ = conv.convert(due["left"], plan.currency, first)
+            cards.append({
+                "plan_id": plan.id,
+                "item": plan.item,
+                "plan_currency": plan.currency,
+                "paid_this_month": money(plan_paid.get(plan.id, Decimal("0"))),
+                "due_numbers": due["numbers"],
+                "due_amount": money(due["amount"]),
+                "due_left": money(due["left"]),
+                "due_left_converted": money(left_conv) if left_conv is not None and plan.currency != conv.display else None,
+                "is_complete": due["is_complete"],
+            })
+        return cards
 
 
 class MonthRatesView(APIView):

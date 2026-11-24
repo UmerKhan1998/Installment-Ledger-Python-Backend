@@ -19,9 +19,9 @@ class ExpenseTests(APITestCase):
         return res.data
 
     def test_settings_default_and_update(self):
-        self.assertEqual(self.client.get("/api/expenses/settings/").data, {"currency": "PKR", "monthly_budget": None, "budget_currency": ""})
+        self.assertEqual(self.client.get("/api/expenses/settings/").data, {"currency": "PKR", "monthly_budget": None, "budget_currency": "", "linked_plans": []})
         res = self.client.patch("/api/expenses/settings/", {"currency": "USD", "monthly_budget": "800"}, format="json")
-        self.assertEqual(res.data, {"currency": "USD", "monthly_budget": "800.00", "budget_currency": "USD"})
+        self.assertEqual(res.data, {"currency": "USD", "monthly_budget": "800.00", "budget_currency": "USD", "linked_plans": []})
 
     def test_new_expense_uses_tracker_currency(self):
         self.assertEqual(self.add()["currency"], "PKR")
@@ -180,7 +180,7 @@ class ConversionTests(APITestCase):
         self.add(title="Laptop plan", amount="75", currency="USD")
         res = self.client.patch("/api/expenses/settings/", {"currency": "USD"}, format="json")
         # The stored budget is never rewritten...
-        self.assertEqual(res.data, {"currency": "USD", "monthly_budget": "100000.00", "budget_currency": "PKR"})
+        self.assertEqual(res.data, {"currency": "USD", "monthly_budget": "100000.00", "budget_currency": "PKR", "linked_plans": []})
         s = self.summary()
         self.assertEqual(s["currency"], "USD")
         self.assertEqual(s["budget"], "361.67")  # ...only shown converted: 100000 x 0.00361667
@@ -274,3 +274,86 @@ class RateStorageTests(APITestCase):
         manual = MonthlyRate.objects.create(user=self.user, month=first, base="USD", quote="PKR", rate=Decimal("280"), source="manual")
         row = Converter(self.user, "PKR")._store(first, "USD", "PKR", {"rate": "276", "date": "2026-11-23"}, manual)
         self.assertEqual((row.rate, row.source), (Decimal("280"), "manual"))
+
+
+class LinkedPlanTests(APITestCase):
+    """Payments of a linked installment plan count as monthly expenses."""
+
+    RATES = {("PKR", "USD", None): "0.00361818", ("USD", "PKR", None): "276.38228878",
+             ("PKR", "USD", "2026-10-31"): "0.0036145", ("USD", "PKR", "2026-10-31"): "276.66333169"}
+
+    def setUp(self):
+        res = self.client.post("/api/auth/register/", {"email": "lp@exp.com", "password": "Sup3r-secret!"}, format="json")
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {res.data['access']}")
+        patcher = mock.patch("expenses.conversion.market_rate", side_effect=fake_market(self.RATES))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        fake_today = mock.patch("expenses.conversion.date")
+        fake = fake_today.start()
+        fake.today.return_value = date(2026, 11, 24)
+        fake.fromisoformat.side_effect = date.fromisoformat
+        self.addCleanup(fake_today.stop)
+        self.plan = self.client.post("/api/plans/", {
+            "item": "MacBook", "purchase_price": "1199", "total_amount": "1350", "months": 18,
+            "first_payment_date": "2026-10-01", "payment_currency": "PKR", "exchange_rate": "276.5",
+        }, format="json").data
+
+    def pay(self, sent, on, rate="276.5"):
+        res = self.client.post(f"/api/plans/{self.plan['id']}/payments/",
+                               {"sent_amount": sent, "exchange_rate": rate, "paid_on": on}, format="json")
+        self.assertEqual(res.status_code, 201, res.data)
+        return res.data
+
+    def link(self, ids):
+        return self.client.patch("/api/expenses/settings/", {"linked_plans": ids}, format="json")
+
+    def summary(self, month="2026-11"):
+        return self.client.get(f"/api/expenses/summary/?month={month}").data
+
+    def test_not_counted_until_linked(self):
+        self.pay("20820", "2026-11-01")
+        self.assertEqual(self.summary()["total"], "0.00")
+        self.assertEqual(self.summary()["plan_payments"], [])
+
+    def test_linked_payments_count_at_the_amount_actually_sent(self):
+        self.client.post("/api/expenses/", {"title": "Rent", "amount": "40000", "category": "rent", "spent_on": "2026-11-01"}, format="json")
+        self.pay("20820", "2026-11-01")
+        self.pay("20000", "2026-10-15")  # October: not in November's total
+        res = self.link([self.plan["id"]])
+        self.assertEqual(res.data["linked_plans"], [self.plan["id"]])
+        s = self.summary()
+        self.assertEqual(s["total"], "60820.00")  # 40000 + PKR 20,820 sent (not its USD value)
+        self.assertEqual(s["count"], 2)
+        inst = next(c for c in s["by_category"] if c["category"] == "installments")
+        self.assertEqual((inst["label"], inst["total"]), ("Installments", "20820.00"))
+        row = s["plan_payments"][0]
+        self.assertEqual((row["plan_item"], row["amount"], row["currency"], row["spent_on"], row["converted"]),
+                         ("MacBook", "20820.00", "PKR", "2026-11-01", None))
+        self.assertEqual({t["month"]: t["total"] for t in s["trend"]}["2026-10"], "20000.00")
+        card = s["linked_plans"][0]
+        self.assertEqual(card["paid_this_month"], "20820.00")
+        self.assertEqual(card["due_numbers"], [2])  # installment #2 is due in November
+
+    def test_linked_payments_are_converted_when_tracking_in_usd(self):
+        self.pay("20820", "2026-11-01")
+        self.link([self.plan["id"]])
+        self.client.patch("/api/expenses/settings/", {"currency": "USD"}, format="json")
+        s = self.summary()
+        self.assertEqual(s["total"], "75.33")  # 20820 x 0.00361818 = 75.3305 -> 75.33
+        self.assertEqual(s["plan_payments"][0]["converted"]["amount"], "75.33")
+        self.assertIsNone(s["linked_plans"][0]["due_left_converted"])  # plan is in USD, same as tracker
+
+    def test_only_own_plans_can_be_linked(self):
+        other = self.client.post("/api/auth/register/", {"email": "x2@exp.com", "password": "Sup3r-secret!"}, format="json")
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {other.data['access']}")
+        self.assertEqual(self.link([self.plan["id"]]).status_code, 400)
+
+    def test_unlink_and_delete(self):
+        self.pay("20820", "2026-11-01")
+        self.link([self.plan["id"]])
+        self.assertEqual(self.link([]).data["linked_plans"], [])
+        self.assertEqual(self.summary()["total"], "0.00")
+        self.link([self.plan["id"]])
+        self.client.delete(f"/api/plans/{self.plan['id']}/")
+        self.assertEqual(self.client.get("/api/expenses/settings/").data["linked_plans"], [])
+        self.assertEqual(self.summary()["linked_plans"], [])

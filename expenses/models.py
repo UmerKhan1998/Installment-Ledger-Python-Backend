@@ -32,6 +32,8 @@ class ExpenseSettings(models.Model):
     # The budget is kept exactly as entered, in the currency it was entered in. Switching the tracker
     # currency only converts it for display, so switching back never drifts (120,000 stays 120,000).
     budget_currency = models.CharField(max_length=3, choices=CURRENCY_CHOICES, blank=True)
+    # Installment plans whose payments also count as monthly expenses (shown read-only, edited in Plans).
+    linked_plans = models.ManyToManyField("ledger.Plan", blank=True, related_name="+")
 
     def __str__(self):
         return f"{self.user} · {self.currency}"
