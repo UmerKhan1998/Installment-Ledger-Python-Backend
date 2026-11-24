@@ -114,3 +114,55 @@ class MonthBudget(models.Model):
     class Meta:
         constraints = [models.UniqueConstraint(fields=["user", "month"], name="uniq_month_budget")]
         ordering = ["-month"]
+
+
+PROJECT_TEMPLATES = {
+    "wedding": ["Venue", "Catering", "Clothing", "Jewellery", "Decor", "Photography", "Gifts", "Transport", "Invitations", "Other"],
+    "qurbani": ["Animal", "Feed", "Transport", "Butcher", "Shelter", "Distribution", "Other"],
+    "travel": ["Flights", "Hotel", "Food", "Local transport", "Visa", "Shopping", "Other"],
+    "home": ["Materials", "Labour", "Furniture", "Appliances", "Fittings", "Other"],
+    "custom": ["Other"],
+}
+
+
+class Project(models.Model):
+    """A separate expense book for a one-off goal (wedding, Qurbani cow, trip...). Never counted in monthly expenses."""
+
+    STATUS_CHOICES = [("active", "Active"), ("closed", "Closed")]
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="projects")
+    name = models.CharField(max_length=120)
+    template = models.CharField(max_length=20, default="custom")
+    currency = models.CharField(max_length=3, choices=CURRENCY_CHOICES, default="PKR")
+    budget = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True, validators=[MinValueValidator(Decimal("0"))])
+    start_date = models.DateField(null=True, blank=True)
+    end_date = models.DateField(null=True, blank=True)
+    note = models.CharField(max_length=255, blank=True)
+    categories = models.JSONField(default=list, blank=True, help_text="Category names offered for this project")
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default="active")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["status", "-created_at"]
+
+    def __str__(self):
+        return self.name
+
+
+class ProjectExpense(models.Model):
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="expenses")
+    title = models.CharField(max_length=120)
+    amount = models.DecimalField(max_digits=14, decimal_places=2, validators=[MinValueValidator(Decimal("0.01"))])
+    currency = models.CharField(max_length=3, choices=CURRENCY_CHOICES)
+    category = models.CharField(max_length=60, default="Other")
+    spent_on = models.DateField()
+    note = models.CharField(max_length=255, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-spent_on", "-created_at"]
+
+    def __str__(self):
+        return f"{self.title} {self.currency} {self.amount}"

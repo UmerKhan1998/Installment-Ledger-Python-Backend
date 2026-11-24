@@ -10,3 +10,17 @@ class ExpenseAdmin(admin.ModelAdmin):
 
 
 admin.site.register(ExpenseSettings)
+
+
+from .models import Project, ProjectExpense  # noqa: E402
+
+
+class ProjectExpenseInline(admin.TabularInline):
+    model = ProjectExpense
+    extra = 0
+
+
+@admin.register(Project)
+class ProjectAdmin(admin.ModelAdmin):
+    list_display = ("name", "user", "currency", "budget", "status", "start_date", "end_date")
+    inlines = [ProjectExpenseInline]

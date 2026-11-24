@@ -4,7 +4,7 @@ from unittest import mock
 
 from rest_framework.test import APITestCase
 
-from .models import GlobalBudget, MonthlyRate
+from .models import GlobalBudget, MonthlyRate, ProjectExpense
 
 
 class ExpenseTests(APITestCase):
@@ -466,3 +466,93 @@ class BudgetTests(APITestCase):
     def user_id(self):
         from django.contrib.auth import get_user_model
         return get_user_model().objects.get(username="b@exp.com").id
+
+
+class ProjectTests(APITestCase):
+    """Separate expense books (wedding, Qurbani cow...), never counted in monthly expenses."""
+
+    def setUp(self):
+        res = self.client.post("/api/auth/register/", {"email": "pj@exp.com", "password": "Sup3r-secret!"}, format="json")
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {res.data['access']}")
+        patcher = mock.patch("expenses.conversion.market_rate", side_effect=fake_market({("USD", "PKR", "2026-10-31"): "277.12345678"}))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        fake_today = mock.patch("expenses.conversion.date")
+        fake = fake_today.start()
+        fake.today.return_value = date(2026, 11, 24)
+        fake.fromisoformat.side_effect = date.fromisoformat
+        self.addCleanup(fake_today.stop)
+
+    def project(self, **kw):
+        body = {"name": "Wedding", "template": "wedding", "budget": "2000000", "start_date": "2026-09-01", **kw}
+        res = self.client.post("/api/expenses/projects/", body, format="json")
+        self.assertEqual(res.status_code, 201, res.data)
+        return res.data
+
+    def spend(self, pid, **kw):
+        body = {"title": "Hall booking", "amount": "350000", "category": "Venue", "spent_on": "2026-10-05", **kw}
+        res = self.client.post(f"/api/expenses/projects/{pid}/expenses/", body, format="json")
+        self.assertEqual(res.status_code, 201, res.data)
+        return res.data
+
+    def test_create_from_template(self):
+        p = self.project()
+        self.assertEqual(p["currency"], "PKR")  # defaults to the tracker currency
+        self.assertIn("Catering", p["categories"])
+        cow = self.project(name="Qurbani cow", template="qurbani", budget=None)
+        self.assertEqual(cow["categories"][:2], ["Animal", "Feed"])
+        self.assertIsNone(cow["remaining"])
+
+    def test_totals_and_breakdown(self):
+        pid = self.project()["id"]
+        self.spend(pid)
+        self.spend(pid, title="Caterer advance", amount="150000", category="Catering", spent_on="2026-10-20")
+        self.spend(pid, title="Bridal dress", amount="1000", currency="USD", category="Clothing", spent_on="2026-10-28")
+        p = self.client.get(f"/api/expenses/projects/{pid}/").data
+        self.assertEqual(p["spent"], "777123.46")  # 350000 + 150000 + 1000 x 277.12345678
+        self.assertEqual(p["remaining"], "1222876.54")
+        self.assertEqual(p["count"], 3)
+        self.assertEqual([c["category"] for c in p["by_category"]], ["Venue", "Clothing", "Catering"])
+        self.assertEqual(p["by_month"], [{"month": "2026-10", "total": "777123.46"}])
+        rows = self.client.get(f"/api/expenses/projects/{pid}/expenses/").data
+        dress = next(r for r in rows if r["title"] == "Bridal dress")
+        self.assertEqual(dress["converted"]["amount"], "277123.46")
+        self.assertEqual(sum(Decimal(r["converted"]["amount"] if r["converted"] else r["amount"]) for r in rows), Decimal(p["spent"]))
+
+    def test_new_category_is_remembered(self):
+        pid = self.project()["id"]
+        self.spend(pid, category="Mehndi night")
+        self.assertIn("Mehndi night", self.client.get(f"/api/expenses/projects/{pid}/").data["categories"])
+
+    def test_never_counted_in_monthly_expenses(self):
+        pid = self.project()["id"]
+        self.spend(pid, spent_on="2026-11-02")
+        self.assertEqual(self.client.get("/api/expenses/summary/?month=2026-11").data["total"], "0.00")
+        self.assertEqual(self.client.get("/api/expenses/?month=2026-11").data, [])
+
+    def test_edit_close_delete(self):
+        pid = self.project()["id"]
+        eid = self.spend(pid)["id"]
+        self.assertEqual(self.client.patch(f"/api/expenses/projects/{pid}/expenses/{eid}/", {"amount": "360000"}, format="json").data["amount"], "360000.00")
+        self.assertEqual(self.client.patch(f"/api/expenses/projects/{pid}/", {"status": "closed"}, format="json").data["status"], "closed")
+        self.assertEqual(self.client.patch(f"/api/expenses/projects/{pid}/", {"end_date": "2026-08-01"}, format="json").status_code, 400)
+        self.assertEqual(self.client.delete(f"/api/expenses/projects/{pid}/").status_code, 204)
+        self.assertEqual(ProjectExpense.objects.count(), 0)
+
+    def test_bulk_delete_is_all_or_nothing(self):
+        a = self.project()["id"]
+        b = self.project(name="Cow", template="qurbani")["id"]
+        x, y = self.spend(a)["id"], self.spend(a, title="Decor")["id"]
+        other = self.spend(b, title="Cow")["id"]
+        self.assertEqual(self.client.post(f"/api/expenses/projects/{a}/expenses/bulk-delete/", {"ids": [x, other]}, format="json").status_code, 404)
+        self.assertEqual(self.client.post(f"/api/expenses/projects/{a}/expenses/bulk-delete/", {"ids": [x, y]}, format="json").data, {"deleted": 2})
+
+    def test_validation_and_isolation(self):
+        self.assertEqual(self.client.post("/api/expenses/projects/", {"name": " "}, format="json").status_code, 400)
+        self.assertEqual(self.client.post("/api/expenses/projects/", {"name": "X", "template": "nope"}, format="json").status_code, 400)
+        pid = self.project()["id"]
+        other = self.client.post("/api/auth/register/", {"email": "pj2@exp.com", "password": "Sup3r-secret!"}, format="json")
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {other.data['access']}")
+        self.assertEqual(self.client.get(f"/api/expenses/projects/{pid}/").status_code, 404)
+        self.assertEqual(self.client.post(f"/api/expenses/projects/{pid}/expenses/", {"title": "x", "amount": "1", "spent_on": "2026-11-01"}, format="json").status_code, 404)
+        self.assertEqual(self.client.get("/api/expenses/projects/").data, [])
