@@ -4,7 +4,7 @@ from unittest import mock
 
 from rest_framework.test import APITestCase
 
-from .models import MonthlyRate
+from .models import GlobalBudget, MonthlyRate
 
 
 class ExpenseTests(APITestCase):
@@ -19,9 +19,9 @@ class ExpenseTests(APITestCase):
         return res.data
 
     def test_settings_default_and_update(self):
-        self.assertEqual(self.client.get("/api/expenses/settings/").data, {"currency": "PKR", "monthly_budget": None, "budget_currency": "", "linked_plans": []})
-        res = self.client.patch("/api/expenses/settings/", {"currency": "USD", "monthly_budget": "800"}, format="json")
-        self.assertEqual(res.data, {"currency": "USD", "monthly_budget": "800.00", "budget_currency": "USD", "linked_plans": []})
+        self.assertEqual(self.client.get("/api/expenses/settings/").data, {"currency": "PKR", "linked_plans": []})
+        res = self.client.patch("/api/expenses/settings/", {"currency": "USD"}, format="json")
+        self.assertEqual(res.data, {"currency": "USD", "linked_plans": []})
 
     def test_new_expense_uses_tracker_currency(self):
         self.assertEqual(self.add()["currency"], "PKR")
@@ -38,7 +38,7 @@ class ExpenseTests(APITestCase):
         self.assertEqual(self.client.get("/api/expenses/?month=nope").status_code, 400)
 
     def test_summary(self):
-        self.client.patch("/api/expenses/settings/", {"monthly_budget": "60000"}, format="json")
+        self.client.put("/api/expenses/budget/", {"scope": "month", "month": "2026-11", "amount": "60000"}, format="json")
         self.add(title="Rent", amount="40000", category="rent", spent_on="2026-11-01")
         self.add(title="Groceries", amount="8000", category="food", spent_on="2026-11-05")
         self.add(title="Fruit", amount="2000", category="food", spent_on="2026-11-06")
@@ -175,12 +175,12 @@ class ConversionTests(APITestCase):
         self.assertEqual(self.summary()["previous_month_total"], "27712.35")
 
     def test_switching_currency_reconverts_everything_and_the_budget(self):
-        self.client.patch("/api/expenses/settings/", {"monthly_budget": "100000"}, format="json")
+        self.client.put("/api/expenses/budget/", {"scope": "month", "month": "2026-11", "amount": "100000"}, format="json")
         self.add(title="Rent", amount="40000", category="rent")
         self.add(title="Laptop plan", amount="75", currency="USD")
         res = self.client.patch("/api/expenses/settings/", {"currency": "USD"}, format="json")
         # The stored budget is never rewritten...
-        self.assertEqual(res.data, {"currency": "USD", "monthly_budget": "100000.00", "budget_currency": "PKR", "linked_plans": []})
+        self.assertEqual(res.data, {"currency": "USD", "linked_plans": []})
         s = self.summary()
         self.assertEqual(s["currency"], "USD")
         self.assertEqual(s["budget"], "361.67")  # ...only shown converted: 100000 x 0.00361667
@@ -197,10 +197,8 @@ class ConversionTests(APITestCase):
 
     def test_new_budget_is_in_the_current_tracker_currency(self):
         self.client.patch("/api/expenses/settings/", {"currency": "USD"}, format="json")
-        res = self.client.patch("/api/expenses/settings/", {"monthly_budget": "400"}, format="json")
-        self.assertEqual(res.data["budget_currency"], "USD")
-        cleared = self.client.patch("/api/expenses/settings/", {"monthly_budget": None}, format="json")
-        self.assertEqual(cleared.data["budget_currency"], "")
+        res = self.client.put("/api/expenses/budget/", {"scope": "month", "month": "2026-11", "amount": "400"}, format="json")
+        self.assertEqual(res.data["applies"], {"amount": "400.00", "currency": "USD", "source": "month"})
 
     def test_manual_rate_overrides_and_can_be_reset(self):
         self.add(amount="75", currency="USD")
@@ -357,3 +355,114 @@ class LinkedPlanTests(APITestCase):
         self.client.delete(f"/api/plans/{self.plan['id']}/")
         self.assertEqual(self.client.get("/api/expenses/settings/").data["linked_plans"], [])
         self.assertEqual(self.summary()["linked_plans"], [])
+
+
+
+class BudgetTests(APITestCase):
+    """Global budget (from a month onward, versioned) + per-month budgets. "Today" is Nov 24, 2026."""
+
+    def setUp(self):
+        res = self.client.post("/api/auth/register/", {"email": "b@exp.com", "password": "Sup3r-secret!"}, format="json")
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {res.data['access']}")
+        patcher = mock.patch("expenses.views.date")
+        fake = patcher.start()
+        fake.today.return_value = date(2026, 11, 24)
+        fake.side_effect = lambda *a, **k: date(*a, **k)
+        self.addCleanup(patcher.stop)
+
+    def put(self, **body):
+        return self.client.put("/api/expenses/budget/", body, format="json")
+
+    def budget(self, month):
+        return self.client.get(f"/api/expenses/budget/?month={month}").data
+
+    def summary(self, month):
+        return self.client.get(f"/api/expenses/summary/?month={month}").data
+
+    def test_global_budget_applies_from_this_month_on_not_before(self):
+        res = self.put(scope="global", amount="120000")
+        self.assertEqual(res.data["global_now"]["amount"], "120000.00")
+        self.assertEqual(self.budget("2026-11")["applies"], {"amount": "120000.00", "currency": "PKR", "source": "global"})
+        self.assertEqual(self.budget("2027-03")["applies"]["amount"], "120000.00")   # future months follow
+        self.assertEqual(self.budget("2026-10")["applies"]["amount"], None)          # past months don't
+        self.assertIsNone(self.summary("2026-10")["budget"])
+
+    def test_changing_global_keeps_old_value_for_past_months(self):
+        GlobalBudget.objects.create(user_id=self.user_id(), effective_from=date(2026, 6, 1), amount="100000", currency="PKR")
+        self.put(scope="global", amount="150000")
+        self.assertEqual(self.budget("2026-08")["applies"]["amount"], "100000.00")  # before the change
+        self.assertEqual(self.budget("2026-11")["applies"]["amount"], "150000.00")  # from this month
+        self.assertEqual(self.summary("2026-08")["budget"], "100000.00")
+        hist = self.budget("2026-11")["global_history"]
+        self.assertEqual([(h["effective_from"], h["amount"]) for h in hist], [("2026-11", "150000.00"), ("2026-06", "100000.00")])
+
+    def test_changing_global_twice_in_a_month_updates_that_version(self):
+        self.put(scope="global", amount="100000")
+        self.put(scope="global", amount="110000")
+        self.assertEqual(GlobalBudget.objects.count(), 1)
+        self.assertEqual(self.budget("2026-11")["applies"]["amount"], "110000.00")
+
+    def test_global_from_a_future_month_and_not_from_the_past(self):
+        self.put(scope="global", amount="100000")
+        self.put(scope="global", amount="130000", from_month="2027-01")
+        self.assertEqual(self.budget("2026-12")["applies"]["amount"], "100000.00")
+        self.assertEqual(self.budget("2027-01")["applies"]["amount"], "130000.00")
+        self.assertEqual(self.put(scope="global", amount="1", from_month="2026-10").status_code, 400)
+
+    def test_removing_global_budget_from_this_month(self):
+        GlobalBudget.objects.create(user_id=self.user_id(), effective_from=date(2026, 6, 1), amount="100000", currency="PKR")
+        self.put(scope="global", amount=None)
+        self.assertIsNone(self.budget("2026-11")["applies"]["amount"])
+        self.assertEqual(self.budget("2026-09")["applies"]["amount"], "100000.00")
+
+    def test_month_budget_overrides_and_resets_to_global(self):
+        self.put(scope="global", amount="120000")
+        res = self.put(scope="month", month="2026-12", amount="200000")  # e.g. a wedding month
+        self.assertEqual(res.data["applies"], {"amount": "200000.00", "currency": "PKR", "source": "month"})
+        self.assertEqual(self.budget("2027-01")["applies"]["amount"], "120000.00")  # only that month
+        self.assertEqual(self.summary("2026-12")["budget_source"], "month")
+        reset = self.client.delete("/api/expenses/budget/?month=2026-12").data
+        self.assertEqual(reset["applies"], {"amount": "120000.00", "currency": "PKR", "source": "global"})
+        self.assertIsNone(reset["month_budget"])
+
+    def test_past_month_can_get_its_own_budget(self):
+        self.put(scope="global", amount="120000")
+        self.put(scope="month", month="2026-09", amount="90000")
+        self.assertEqual(self.budget("2026-09")["applies"]["amount"], "90000.00")
+        self.assertIsNone(self.budget("2026-10")["applies"]["amount"])
+
+    def test_validation(self):
+        self.assertEqual(self.put(scope="month", month="2026-11", amount="-5").status_code, 400)
+        self.assertEqual(self.put(scope="month", month="2026-11", amount=None).status_code, 400)
+        self.assertEqual(self.put(scope="month", month="2026-11", amount="abc").status_code, 400)
+        self.assertEqual(self.put(scope="other", amount="1").status_code, 400)
+
+    def test_budgets_are_per_user(self):
+        self.put(scope="global", amount="120000")
+        other = self.client.post("/api/auth/register/", {"email": "b2@exp.com", "password": "Sup3r-secret!"}, format="json")
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {other.data['access']}")
+        self.assertIsNone(self.budget("2026-11")["applies"]["amount"])
+
+    def test_migration_keeps_the_old_budget_for_every_month(self):
+        from importlib import import_module
+        from django.apps import apps
+        from .models import ExpenseSettings
+        mig = import_module("expenses.migrations.0005_budgets")
+
+        class Prefs:  # the removed fields, as the migration saw them
+            def __init__(self, user_id):
+                self.user_id, self.monthly_budget, self.budget_currency, self.currency = user_id, Decimal("80000"), "PKR", "PKR"
+
+        fake_apps = mock.Mock()
+        fake_apps.get_model.side_effect = lambda app, name: (
+            mock.Mock(objects=mock.Mock(exclude=lambda **kw: [Prefs(self.user_id())])) if name == "ExpenseSettings"
+            else apps.get_model(app, name)
+        )
+        mig.copy_budget_to_global(fake_apps, None)
+        self.assertEqual(self.budget("2025-01")["applies"]["amount"], "80000.00")
+        self.assertTrue(self.budget("2026-11")["global_now"]["since_start"])
+        self.assertTrue(ExpenseSettings)
+
+    def user_id(self):
+        from django.contrib.auth import get_user_model
+        return get_user_model().objects.get(username="b@exp.com").id

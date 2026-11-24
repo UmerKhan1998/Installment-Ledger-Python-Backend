@@ -22,16 +22,11 @@ CATEGORY_CHOICES = [
 
 
 class ExpenseSettings(models.Model):
-    """Per-user choices for the expense tracker: the currency it is kept in, and an optional budget."""
+    """Per-user choices for the expense tracker: the currency it is shown in and the linked plans.
+    Budgets live in GlobalBudget (versioned) and MonthBudget (one month only)."""
 
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="expense_settings")
     currency = models.CharField(max_length=3, choices=CURRENCY_CHOICES, default="PKR")
-    monthly_budget = models.DecimalField(
-        max_digits=14, decimal_places=2, null=True, blank=True, validators=[MinValueValidator(Decimal("0"))]
-    )
-    # The budget is kept exactly as entered, in the currency it was entered in. Switching the tracker
-    # currency only converts it for display, so switching back never drifts (120,000 stays 120,000).
-    budget_currency = models.CharField(max_length=3, choices=CURRENCY_CHOICES, blank=True)
     # Installment plans whose payments also count as monthly expenses (shown read-only, edited in Plans).
     linked_plans = models.ManyToManyField("ledger.Plan", blank=True, related_name="+")
 
@@ -85,3 +80,37 @@ class MonthlyRate(models.Model):
 
     def __str__(self):
         return f"{self.month:%Y-%m} 1 {self.base} = {self.rate} {self.quote} ({self.source})"
+
+
+class GlobalBudget(models.Model):
+    """One version of the global monthly budget, in force from `effective_from` until the next version.
+
+    Changing the global budget adds a version from the current month, so earlier months keep the budget they had.
+    `amount` None means "no budget" from that month on. Amounts are kept exactly as entered, in the currency
+    they were entered in; other currencies only convert them for display (no round-trip drift).
+    """
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="global_budgets")
+    effective_from = models.DateField(help_text="First day of the first month this version applies to")
+    amount = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True, validators=[MinValueValidator(Decimal("0"))])
+    currency = models.CharField(max_length=3, choices=CURRENCY_CHOICES)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["user", "effective_from"], name="uniq_global_budget_version")]
+        ordering = ["-effective_from"]
+
+
+class MonthBudget(models.Model):
+    """A budget for one month only; overrides the global budget for that month until it is reset."""
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="month_budgets")
+    month = models.DateField(help_text="First day of the month")
+    amount = models.DecimalField(max_digits=14, decimal_places=2, validators=[MinValueValidator(Decimal("0"))])
+    currency = models.CharField(max_length=3, choices=CURRENCY_CHOICES)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["user", "month"], name="uniq_month_budget")]
+        ordering = ["-month"]

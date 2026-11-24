@@ -16,7 +16,8 @@ from ledger.models import CURRENCY_CHOICES, Payment, Plan
 
 from .conversion import Converter, rate_payload, to_cents
 from .plans import INSTALLMENTS, INSTALLMENTS_LABEL, due_in_month, linked_payments, linked_plan_ids
-from .models import CATEGORY_CHOICES, Expense, ExpenseSettings, MonthlyRate
+from .budget import global_version, resolve, version_payload
+from .models import CATEGORY_CHOICES, Expense, ExpenseSettings, GlobalBudget, MonthBudget, MonthlyRate
 from .serializers import ExpenseSerializer, ExpenseSettingsSerializer
 
 TREND_MONTHS = 6
@@ -53,19 +54,88 @@ def money(value):
 
 
 class ExpenseSettingsView(generics.RetrieveUpdateAPIView):
-    """Changing the currency never rewrites the budget; a newly entered budget is in the tracker currency."""
+    """Tracker currency and linked plans. Changing the currency never rewrites a budget (only its display)."""
 
     serializer_class = ExpenseSettingsSerializer
 
     def get_object(self):
         return settings_for(self.request.user)
 
-    def perform_update(self, serializer):
-        extra = {}
-        if "monthly_budget" in serializer.validated_data:
-            cur = serializer.validated_data.get("currency", serializer.instance.currency)
-            extra["budget_currency"] = cur if serializer.validated_data["monthly_budget"] is not None else ""
-        serializer.save(**extra)
+
+class BudgetView(APIView):
+    """Monthly budgets: a global budget (versioned, from a month onward) and per-month budgets.
+
+    GET    /api/expenses/budget/?month=2026-11 -> what applies to that month, the month's own budget (if any),
+                                                  the global budget now, and the global history
+    PUT    /api/expenses/budget/ {"scope": "global", "amount": "120000" | null[, "from_month": "2026-12"]}
+           -> global budget from `from_month` (default: this month) onward; earlier months are untouched.
+              from_month can't be in the past. amount null = no global budget from then on.
+    PUT    /api/expenses/budget/ {"scope": "month", "month": "2026-11", "amount": "90000"} -> that month only
+    DELETE /api/expenses/budget/?month=2026-11 -> reset that month to the global budget
+    Amounts are in the current tracker currency and kept as entered.
+    """
+
+    def _amount(self, raw, allow_null):
+        if raw in (None, "") and allow_null:
+            return None
+        try:
+            value = Decimal(str(raw))
+        except Exception:
+            raise ValidationError({"amount": "Enter a number."})
+        if not value.is_finite() or value < 0:
+            raise ValidationError({"amount": "The budget can't be negative."})
+        return value.quantize(Decimal("0.01"))
+
+    def _payload(self, request, first):
+        info = resolve(request.user, first)
+        this_month = date.today().replace(day=1)
+        history = GlobalBudget.objects.filter(user=request.user).order_by("-effective_from")[:24]
+        return {
+            "month": first.strftime("%Y-%m"),
+            "tracker_currency": settings_for(request.user).currency,
+            "applies": {
+                "amount": f"{info['amount']:.2f}" if info["amount"] is not None else None,
+                "currency": info["currency"],
+                "source": info["source"],
+            },
+            "month_budget": (
+                {"amount": f"{info['override'].amount:.2f}", "currency": info["override"].currency}
+                if info["override"] else None
+            ),
+            "global_for_month": version_payload(info["global"]),
+            "global_now": version_payload(global_version(request.user, this_month)),
+            "global_history": [version_payload(v) for v in history],
+            "current_month": this_month.strftime("%Y-%m"),
+        }
+
+    def get(self, request):
+        return Response(self._payload(request, parse_month(request.query_params.get("month"))))
+
+    def put(self, request):
+        cur = settings_for(request.user).currency
+        scope = request.data.get("scope")
+        if scope == "global":
+            this_month = date.today().replace(day=1)
+            start = parse_month(request.data.get("from_month")) if request.data.get("from_month") else this_month
+            if start < this_month:
+                raise ValidationError({"from_month": "A global budget change applies from this month onward. "
+                                                     "To change a past month, set that month's own budget."})
+            amount = self._amount(request.data.get("amount"), allow_null=True)
+            GlobalBudget.objects.update_or_create(
+                user=request.user, effective_from=start, defaults={"amount": amount, "currency": cur},
+            )
+            return Response(self._payload(request, parse_month(request.data.get("month")) if request.data.get("month") else start))
+        if scope == "month":
+            first = parse_month(request.data.get("month"))
+            amount = self._amount(request.data.get("amount"), allow_null=False)
+            MonthBudget.objects.update_or_create(user=request.user, month=first, defaults={"amount": amount, "currency": cur})
+            return Response(self._payload(request, first))
+        raise ValidationError({"scope": 'Use "global" or "month".'})
+
+    def delete(self, request):
+        first = parse_month(request.query_params.get("month"))
+        MonthBudget.objects.filter(user=request.user, month=first).delete()
+        return Response(self._payload(request, first))
 
 
 class ExpenseListCreateView(generics.ListCreateAPIView):
@@ -213,11 +283,13 @@ class ExpenseSummaryView(APIView):
             .values_list("title", "category") if (t.lower(), c) not in here
         )
 
-        # Budget as entered, converted for display at this month's rate if it was set in another currency.
-        budget = prefs.monthly_budget
+        # The month's budget (its own, else the global version in force then), as entered; converted for
+        # display at this month's rate if it was set in another currency.
+        info = resolve(request.user, first)
+        budget = info["amount"]
         budget_rate = None
-        if budget is not None and prefs.budget_currency and prefs.budget_currency != cur:
-            budget, budget_rate = conv.convert(budget, prefs.budget_currency, first)
+        if budget is not None and info["currency"] != cur:
+            budget, budget_rate = conv.convert(budget, info["currency"], first)
         days_in_month = (end - start).days
         today = date.today()
         elapsed = days_in_month if end <= today else max((today - start).days + 1, 0) if start <= today else 0
@@ -229,8 +301,9 @@ class ExpenseSummaryView(APIView):
             "budget": money(budget) if budget is not None else None,
             "remaining": money(budget - total) if budget is not None else None,
             "budget_used_percent": float(round(total / budget * 100, 1)) if budget else None,
+            "budget_source": info["source"],
             "budget_original": (
-                {"amount": money(prefs.monthly_budget), "currency": prefs.budget_currency,
+                {"amount": money(info["amount"]), "currency": info["currency"],
                  "rate": f"{budget_rate.rate:.8f}".rstrip("0").rstrip(".")} if budget_rate else None
             ),
             "daily_average": money(to_cents(total / elapsed)) if elapsed else money(0),

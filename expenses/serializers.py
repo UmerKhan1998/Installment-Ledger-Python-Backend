@@ -6,15 +6,13 @@ from .models import CATEGORY_CHOICES, Expense, ExpenseSettings
 
 
 class ExpenseSettingsSerializer(serializers.ModelSerializer):
-    """`monthly_budget` is sent in the tracker currency; it is stored as entered with `budget_currency`.
-    `linked_plans`: ids of the user's plans whose payments count as expenses."""
+    """`linked_plans`: ids of the user's plans whose payments count as expenses. Budgets: /api/expenses/budget/."""
 
     linked_plans = serializers.PrimaryKeyRelatedField(many=True, required=False, queryset=Plan.objects.none())
 
     class Meta:
         model = ExpenseSettings
-        fields = ("currency", "monthly_budget", "budget_currency", "linked_plans")
-        read_only_fields = ("budget_currency",)
+        fields = ("currency", "linked_plans")
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
