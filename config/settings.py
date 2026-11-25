@@ -44,6 +44,7 @@ INSTALLED_APPS = [
     "accounts",
     "ledger",
     "expenses",
+    "assistant",
 ]
 
 MIDDLEWARE = [
@@ -150,6 +151,13 @@ if not DEBUG:
 
 # Firebase: sign-in (only the project id is needed) and receipt storage (needs a service account; until one is
 # configured, receipts stay in the database). See accounts/firebase_auth.py and ledger/receipt_storage.py.
+# Gemini (cloud LLM). Server-side only; see agents.md §21.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+# Used when the main model is overloaded/unavailable (503 UNAVAILABLE).
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
+GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001")
+
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "")
 FIREBASE_STORAGE_BUCKET = os.getenv("FIREBASE_STORAGE_BUCKET", "")
 FIREBASE_SERVICE_ACCOUNT_FILE = os.getenv("FIREBASE_SERVICE_ACCOUNT_FILE", "")
@@ -161,6 +169,9 @@ REST_FRAMEWORK = {
         "accounts.security.LegacyJWTAuthentication",
     ),
     "DEFAULT_PERMISSION_CLASSES": ("rest_framework.permissions.IsAuthenticated",),
+    # Scoped limits only where calls cost money or hit third parties (views opt in with `throttle_scope`).
+    "DEFAULT_THROTTLE_CLASSES": ("rest_framework.throttling.ScopedRateThrottle",),
+    "DEFAULT_THROTTLE_RATES": {"ai_test": os.getenv("AI_TEST_RATE", "20/hour")},
 }
 
 SIMPLE_JWT = {
