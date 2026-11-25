@@ -1,3 +1,4 @@
+from unittest import mock
 from datetime import date
 from decimal import Decimal
 
@@ -472,3 +473,96 @@ class BulkTests(APITestCase):
         self.assertEqual(self.client.post(url, {"ids": []}, format="json").status_code, 400)
         self.assertEqual(self.client.post(url, {"ids": ["x"]}, format="json").status_code, 400)
         self.assertEqual(self.client.post(url, {}, format="json").status_code, 400)
+
+
+class FakeBucket:
+    def __init__(self):
+        self.objects = {}
+
+    def blob(self, path):
+        bucket = self
+
+        class Blob:
+            cache_control = None
+
+            def upload_from_string(self, data, content_type=None):
+                bucket.objects[path] = (bytes(data), content_type)
+
+            def download_as_bytes(self):
+                return bucket.objects[path][0]
+
+            def delete(self):
+                bucket.objects.pop(path)
+
+        return Blob()
+
+
+class FirebaseReceiptStorageTests(APITestCase):
+    def setUp(self):
+        self.bucket = FakeBucket()
+        for target, value in (("ledger.receipt_storage.enabled", True), ("ledger.receipt_storage.bucket", self.bucket)):
+            patcher = mock.patch(target, return_value=value) if target.endswith("enabled") else mock.patch(target, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        res = self.client.post("/api/auth/register/", {"email": "fs@example.com", "password": "Sup3r-secret!"}, format="json")
+        self.user_id = res.data["user"]["id"]
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {res.data['access']}")
+        self.plan = self.client.post("/api/plans/", {"item": "MacBook", "purchase_price": "1199", "total_amount": "1350", "months": 18,
+                                                     "first_payment_date": "2026-11-01"}, format="json").data
+
+    @staticmethod
+    def image(shade):
+        import io
+
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.new("RGB", (20, 20), (shade % 256, 120, 200)).save(buf, "PNG")  # a different image per receipt
+        return SimpleUploadedFile(f"receipt-{shade}.png", buf.getvalue(), content_type="image/png")
+
+    def upload(self, amount="10"):
+        res = self.client.post(f"/api/plans/{self.plan['id']}/payments/",
+                               {"amount": amount, "paid_on": "2026-11-01", "receipt": self.image(int(float(amount)))}, format="multipart")
+        self.assertEqual(res.status_code, 201, res.data)
+        return res.data
+
+    def test_receipt_goes_to_the_bucket_not_the_database(self):
+        from .models import Payment
+        pay = self.upload()
+        p = Payment.objects.get(pk=pay["id"])
+        self.assertTrue(p.receipt_path.startswith(f"users/{self.user_id}/receipts/{pay['id']}-"))
+        self.assertIsNone(p.receipt_data)
+        img = self.client.get(f"/api/plans/{self.plan['id']}/payments/{pay['id']}/receipt/")
+        self.assertEqual(img.status_code, 200)
+        self.assertEqual(img.content, self.bucket.objects[p.receipt_path][0])
+
+    def test_deleting_payments_or_the_plan_deletes_objects(self):
+        a, b = self.upload("10"), self.upload("11")
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.delete(f"/api/plans/{self.plan['id']}/payments/{a['id']}/")
+        self.assertEqual(len(self.bucket.objects), 1)
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.delete(f"/api/plans/{self.plan['id']}/")
+        self.assertEqual(self.bucket.objects, {})
+        self.assertTrue(b)
+
+    def test_upload_failure_falls_back_to_the_database(self):
+        from .models import Payment
+        with mock.patch("ledger.receipt_storage.save", side_effect=RuntimeError("bucket down")):
+            pay = self.upload()
+        p = Payment.objects.get(pk=pay["id"])
+        self.assertEqual(p.receipt_path, "")
+        self.assertIsNotNone(p.receipt_data)
+        self.assertEqual(self.client.get(f"/api/plans/{self.plan['id']}/payments/{pay['id']}/receipt/").status_code, 200)
+
+    def test_move_command_moves_and_verifies(self):
+        from django.core.management import call_command
+
+        from .models import Payment
+        with mock.patch("ledger.receipt_storage.enabled", return_value=False):
+            pay = self.upload()
+        self.assertIsNotNone(Payment.objects.get(pk=pay["id"]).receipt_data)
+        call_command("move_receipts_to_firebase", stdout=open("/dev/null", "w"))
+        p = Payment.objects.get(pk=pay["id"])
+        self.assertIsNone(p.receipt_data)
+        self.assertIn(p.receipt_path, self.bucket.objects)

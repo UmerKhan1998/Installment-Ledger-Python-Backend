@@ -1,8 +1,12 @@
 from decimal import Decimal
 
+import logging
+
+from django.db import transaction
 from rest_framework import serializers
 
 from .duplicates import describe, file_hash, find_duplicate, normalize_hash, normalize_reference
+from . import receipt_storage
 from .models import Payment, Plan
 from .schedule import plan_figures, to_cents
 
@@ -43,21 +47,40 @@ class PaymentSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(f"Receipt must be under {MAX_RECEIPT_BYTES // (1024 * 1024)} MB.")
         return file
 
-    def _store_receipt(self, validated_data):
-        file = validated_data.pop("receipt", None)
-        if file:
-            validated_data.update(
-                receipt_data=file.read(),
-                receipt_type=getattr(file, "content_type", "") or "image/jpeg",
-                receipt_name=(file.name or "receipt")[:200],
-            )
-        return validated_data
+    def _attach_receipt(self, payment, file):
+        """Store the receipt in Firebase Storage when configured, else in the database (also the fallback)."""
+        if not file:
+            return
+        data = file.read()
+        content_type = getattr(file, "content_type", "") or "image/jpeg"
+        old_path = payment.receipt_path
+        fields = {"receipt_type": content_type, "receipt_name": (file.name or "receipt")[:200]}
+        stored = False
+        if receipt_storage.enabled():
+            try:
+                fields.update(receipt_path=receipt_storage.save(payment.plan.user_id, payment.pk, data, content_type), receipt_data=None)
+                stored = True
+            except Exception:
+                logging.getLogger(__name__).exception("Firebase upload failed; keeping the receipt in the database")
+        if not stored:
+            fields.update(receipt_data=data, receipt_path="")
+        for key, value in fields.items():
+            setattr(payment, key, value)
+        payment.save(update_fields=[*fields])
+        if old_path and old_path != payment.receipt_path:
+            transaction.on_commit(lambda: receipt_storage.delete(old_path))
 
     def create(self, validated_data):
-        return super().create(self._store_receipt(validated_data))
+        file = validated_data.pop("receipt", None)
+        payment = super().create(validated_data)
+        self._attach_receipt(payment, file)
+        return payment
 
     def update(self, instance, validated_data):
-        return super().update(instance, self._store_receipt(validated_data))
+        file = validated_data.pop("receipt", None)
+        payment = super().update(instance, validated_data)
+        self._attach_receipt(payment, file)
+        return payment
 
     def validate(self, attrs):
         plan = self.context["plan"]

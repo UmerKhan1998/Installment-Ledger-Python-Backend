@@ -1,0 +1,11 @@
+rules_version = '2';
+
+// Receipts are uploaded and read only through the Django API (which uses a service account and is not
+// subject to these rules). Browsers and apps get no direct access to the bucket.
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

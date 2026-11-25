@@ -70,6 +70,8 @@ class Payment(models.Model):
     receipt_data = models.BinaryField(null=True, blank=True, editable=False)
     receipt_type = models.CharField(max_length=50, blank=True)
     receipt_name = models.CharField(max_length=200, blank=True)
+    # Set when the receipt lives in Firebase Storage instead of receipt_data (see ledger/receipt_storage.py).
+    receipt_path = models.CharField(max_length=300, blank=True)
     # Duplicate detection: bank reference (STAN / TID) and a SHA-256 of the original receipt file.
     reference = models.CharField(max_length=64, blank=True, db_index=True)
     receipt_hash = models.CharField(max_length=64, blank=True, db_index=True)

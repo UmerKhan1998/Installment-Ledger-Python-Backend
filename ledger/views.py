@@ -11,6 +11,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .duplicates import describe, find_duplicate, normalize_hash, normalize_reference
+from . import receipt_storage
 from .models import Payment, Plan, RateSettings
 from .rates import PROVIDERS, SUPPORTED, market_rate, market_rate_for, user_rate_settings
 from .schedule import plan_figures
@@ -133,9 +134,18 @@ class ReceiptView(PlanPaymentMixin, APIView):
 
     def get(self, request, plan_id, pk):
         payment = get_object_or_404(self.get_queryset(), pk=pk)
-        if not payment.receipt_type or payment.receipt_data is None:
+        if not payment.receipt_type:
             raise Http404
-        response = HttpResponse(bytes(payment.receipt_data), content_type=payment.receipt_type)
+        if payment.receipt_path:
+            try:
+                data = receipt_storage.load(payment.receipt_path)
+            except Exception:
+                return Response({"detail": "The receipt file couldn't be loaded from storage right now."}, status=502)
+        elif payment.receipt_data is not None:
+            data = bytes(payment.receipt_data)
+        else:
+            raise Http404
+        response = HttpResponse(data, content_type=payment.receipt_type)
         response["Content-Disposition"] = f'inline; filename="{payment.receipt_name or "receipt"}"'
         response["Cache-Control"] = "private, max-age=3600"
         return response

@@ -6,3 +6,9 @@ db.sqlite3
 staticfiles/
 .env.production
 render.env
+# Firebase service-account keys: secrets, never commit
+*service-account*.json
+firebase-adminsdk*.json
+# Firebase CLI
+firebase-debug.log
+.firebase/
