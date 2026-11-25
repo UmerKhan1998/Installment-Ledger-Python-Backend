@@ -210,7 +210,7 @@ class PlannerTests(APITestCase):
         self.run_planner({"summary": "ok", "sections": [], "next_steps": [], "caveats": []})
         rec = AIInteraction.objects.get()
         self.assertEqual((rec.kind, rec.prompt_version, rec.method_version, rec.model_version, rec.ok),
-                         ("planner", "planner-v2", "surplus-v1", "gemini-3.6-flash", True))
+                         ("planner", "planner-v3", "surplus-v1", "gemini-3.6-flash", True))
         self.assertIn("investable", rec.figure_ids)
         self.assertEqual(len(rec.figures_hash), 64)
 
@@ -229,3 +229,54 @@ class PlannerTests(APITestCase):
         with mock.patch.dict(api_settings.DEFAULT_THROTTLE_RATES, {"ai_planner": "1/hour"}):
             codes = [self.run_planner({"summary": "ok"}).status_code for _ in range(2)]
         self.assertEqual(codes, [200, 429])
+
+
+@override_settings(GEMINI_API_KEY=SECRET, GEMINI_MODEL="gemini-3.5-flash", GEMINI_FALLBACK_MODEL="gemini-3.5-flash-lite")
+class PlannerChatTests(APITestCase):
+    """The chat panel: a free-form question plus a short history; same guardrails as the plan explanation."""
+
+    setUp = PlannerTests.setUp
+    fake_generate = PlannerTests.fake_generate
+
+    def ask(self, body):
+        from .llm.gemini import GeminiProvider
+        answer = {"summary": "Build your emergency fund first.", "sections": [], "next_steps": [], "caveats": []}
+        with mock.patch.object(GeminiProvider, "generate_json", side_effect=self.fake_generate(answer)):
+            return self.client.post("/api/ai/planner/", body, format="json")
+
+    def test_question_and_history_reach_the_prompt(self):
+        self.client.patch("/api/finance/profile/", {"consent_ai": True}, format="json")
+        history = [{"q": f"old {i}", "a": "x" * 900} for i in range(6)]
+        res = self.ask({"question": "  Am I ready\n to invest?  ", "history": history})
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(res.data["question"], "Am I ready to invest?")
+        self.assertEqual(res.data["prompt_version"], "planner-v3")
+        self.assertIn("QUESTION: Am I ready to invest?", self.sent["prompt"])
+        self.assertNotIn("old 1", self.sent["prompt"])          # only the last 4 turns
+        self.assertIn("old 5", self.sent["prompt"])
+        self.assertNotIn("x" * 501, self.sent["prompt"])        # turns trimmed
+        self.assertNotIn("Ayesha", self.sent["prompt"])
+
+    def test_bad_chat_input(self):
+        self.client.patch("/api/finance/profile/", {"consent_ai": True}, format="json")
+        self.assertEqual(self.ask({"question": "q" * 501}).status_code, 400)
+        self.assertEqual(self.ask({"question": "hi", "history": "nope"}).status_code, 400)
+        self.assertEqual(self.ask({"question": ["x"]}).status_code, 400)
+
+
+class OverloadRetryTests(APITestCase):
+    @override_settings(GEMINI_API_KEY=SECRET)
+    def test_overloaded_retries_chosen_model_after_fallback(self):
+        from google.genai import errors
+        busy = errors.APIError(503, {"error": {"code": 503, "status": "UNAVAILABLE", "message": "busy"}})
+        calls = []
+
+        def structured(client, model, *a):
+            calls.append(model)
+            if len(calls) < 3:
+                raise busy
+            return "{}", {"used_fallback": False}
+        with mock.patch.object(GeminiProvider, "_client"), mock.patch.object(GeminiProvider, "_structured", side_effect=structured), \
+                mock.patch("assistant.llm.gemini.RETRY_DELAY_S", 0):
+            GeminiProvider().generate_json("m", "s", "p", dict, fallback_model="lite")
+        self.assertEqual(calls, ["m", "lite", "m"])

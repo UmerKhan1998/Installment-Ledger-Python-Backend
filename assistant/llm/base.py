@@ -64,3 +64,8 @@ class LLMProvider:
         """Structured generation. Returns (text, meta) where meta has model_version, used_fallback,
         latency_ms, input_tokens, output_tokens. The caller validates `text` against `schema`."""
         raise NotImplementedError
+
+    def generate_grounded(self, model: str, system: str, prompt: str, fallback_model: str | None = None):
+        """Prose answer grounded with web search. Returns (grounding, meta), grounding = {parts, chunks, supports,
+        queries, entry_html}. Providers without web grounding raise ProviderError(kind="not_supported")."""
+        raise ProviderError(f"{self.name} can't search the web.", "not_supported")

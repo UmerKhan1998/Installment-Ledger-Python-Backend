@@ -53,7 +53,7 @@ def payload(prefs):
 
 def error_response(err):
     status = {"not_configured": 503, "auth": 502, "not_found": 400, "rate_limited": 429,
-              "overloaded": 503, "timeout": 504}.get(err.kind, 502)
+              "overloaded": 503, "timeout": 504, "not_supported": 400}.get(err.kind, 502)
     return Response({"detail": str(err), "kind": err.kind}, status=status)
 
 
@@ -127,15 +127,46 @@ class AITestView(APIView):
 
 
 class PlannerView(APIView):
-    """POST /api/ai/planner/ -> AI explanation of the user's calculated plan (consent required, throttled)."""
+    """POST /api/ai/planner/ {"question"?, "history"?: [{q, a}]} -> AI answer about the user's calculated plan
+    (consent required, throttled). No question = explain the whole plan."""
 
     throttle_scope = "ai_planner"
 
     def post(self, request):
-        from .planner import ConsentRequired, run_planner
+        from .planner import BadQuestion, ConsentRequired, run_planner
 
         try:
-            return Response(run_planner(request.user))
+            return Response(run_planner(request.user, request.data.get("question"), request.data.get("history")))
+        except BadQuestion as exc:
+            return Response({"detail": str(exc)}, status=400)
+        except ConsentRequired as exc:
+            return Response({"detail": str(exc), "kind": "consent_required"}, status=403)
+        except ProviderError as err:
+            return error_response(err)
+
+
+class OpportunitiesView(APIView):
+    """GET /api/ai/opportunities/ -> your last scan (or null).
+    POST {"region", "risk_level", "horizon_years", "shariah_only", "focus"} -> new web-grounded scan (consent, throttled)."""
+
+    throttle_scope = "ai_opportunities"
+
+    def get_throttles(self):
+        return super().get_throttles() if self.request.method == "POST" else []
+
+    def get(self, request):
+        from .opportunities import REGIONS, RISK_LEVELS, last_scan
+
+        return Response({"scan": last_scan(request.user), "regions": REGIONS, "risk_levels": list(RISK_LEVELS)})
+
+    def post(self, request):
+        from .opportunities import BadRequest, run_scan
+        from .planner import ConsentRequired
+
+        try:
+            return Response(run_scan(request.user, request.data))
+        except BadRequest as exc:
+            return Response({"detail": str(exc)}, status=400)
         except ConsentRequired as exc:
             return Response({"detail": str(exc), "kind": "consent_required"}, status=403)
         except ProviderError as err:

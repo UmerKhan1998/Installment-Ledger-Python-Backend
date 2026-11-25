@@ -18,7 +18,7 @@ from finance.calculations import METHOD_VERSION
 from .llm import get_provider
 from .llm.base import ProviderError
 from .models import AIInteraction
-from .prompts import planner_v2 as prompt
+from .prompts import planner_v3 as prompt
 from .views import settings_for
 
 SOURCE_LABELS = {"user_input": "provided by you", "ledger_expenses": "from your Expenses", "ledger_plans": "from your Plans",
@@ -40,6 +40,33 @@ class PlannerAnswer(BaseModel):
 
 class ConsentRequired(Exception):
     pass
+
+
+class BadQuestion(Exception):
+    pass
+
+
+MAX_QUESTION = 500
+MAX_HISTORY = 4
+
+
+def clean_chat(question, history):
+    """Validate the chat input: a one-paragraph question and up to 4 earlier {q, a} turns (each trimmed)."""
+    if question is not None and not isinstance(question, str):
+        raise BadQuestion("question must be text")
+    question = re.sub(r"\s+", " ", question or "").strip()
+    if len(question) > MAX_QUESTION:
+        raise BadQuestion(f"Keep the question under {MAX_QUESTION} characters.")
+    turns = []
+    if history is not None and not isinstance(history, list):
+        raise BadQuestion("history must be a list")
+    for t in (history or [])[-MAX_HISTORY:]:
+        if not isinstance(t, dict):
+            raise BadQuestion("history items must be objects")
+        q, a = (re.sub(r"\s+", " ", str(t.get(k) or "")).strip()[:MAX_QUESTION] for k in ("q", "a"))
+        if q or a:
+            turns.append({"q": q, "a": a})
+    return question or None, turns
 
 
 def build_figures(result):
@@ -109,10 +136,11 @@ def validate_answer(answer: PlannerAnswer, figures):
     return data, warnings
 
 
-def run_planner(user):
+def run_planner(user, question=None, history=None):
     profile = profile_for(user)
     if not profile.consent_ai:
         raise ConsentRequired("Allow the AI planner to see your summarised figures first (Invest → Your numbers).")
+    question, turns = clean_chat(question, history)
     result = assess(user)
     figures = build_figures(result)
     data = {
@@ -135,7 +163,7 @@ def run_planner(user):
                            figures_hash=hashlib.sha256(data_json.encode()).hexdigest())
     try:
         text, meta = get_provider(prefs.provider).generate_json(
-            model, prompt.SYSTEM, prompt.build_prompt(data_json), PlannerAnswer, fallback_model=settings.GEMINI_FALLBACK_MODEL)
+            model, prompt.SYSTEM, prompt.build_prompt(data_json, question, json.dumps(turns, ensure_ascii=False) if turns else None), PlannerAnswer, fallback_model=settings.GEMINI_FALLBACK_MODEL)
         record.model_version = meta.get("model_version") or ""
         record.used_fallback = meta.get("used_fallback", False)
         record.latency_ms, record.input_tokens, record.output_tokens = meta.get("latency_ms"), meta.get("input_tokens"), meta.get("output_tokens")
@@ -151,6 +179,7 @@ def run_planner(user):
         raise
     record.save()
     return {
+        "question": question,
         "answer": answer_dict,
         "warnings": warnings,
         "figures": figures,

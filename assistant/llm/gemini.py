@@ -9,6 +9,7 @@ from .base import LLMProvider, ModelInfo, ProviderError, TestResult
 
 log = logging.getLogger(__name__)
 TIMEOUT_MS = 20_000
+RETRY_DELAY_S = 2
 # Text-generation models only; drop media/speech/live/embedding/robotics variants and non-Gemini families.
 EXCLUDE = re.compile(r"(tts|image|audio|live|embedding|robotics|computer-use|aqa|veo|imagen|banana|native)", re.I)
 
@@ -170,4 +171,82 @@ class GeminiProvider(LLMProvider):
                 return text, meta
             except Exception:  # noqa: BLE001 - report the original failure
                 pass
+        if err.kind == "overloaded":  # overload is usually seconds long: one more try on the chosen model
+            time.sleep(RETRY_DELAY_S)
+            try:
+                return self._structured(client, model, system, prompt, schema)
+            except Exception:  # noqa: BLE001 - report the original failure
+                pass
+        raise err
+
+    # ---- Google Search grounding (opportunities research) ----
+
+    GROUNDED_TIMEOUT_MS = 90_000
+
+    def _grounded(self, client, model, system, prompt):
+        from google.genai import types
+
+        started = time.monotonic()
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+                temperature=0.2,
+                max_output_tokens=8192,
+            ),
+        )
+        cand = (response.candidates or [None])[0]
+        parts = [p.text or "" for p in ((cand.content.parts if cand and cand.content else None) or []) if getattr(p, "text", None) is not None]
+        gm = getattr(cand, "grounding_metadata", None) if cand else None
+        chunks, supports, queries, entry_html = [], [], [], ""
+        if gm:
+            for ch in gm.grounding_chunks or []:
+                web = getattr(ch, "web", None)
+                chunks.append({"uri": getattr(web, "uri", "") or "", "title": getattr(web, "title", "") or "",
+                               "domain": getattr(web, "domain", "") or ""} if web else None)
+            for s in gm.grounding_supports or []:
+                seg = s.segment
+                if seg is None or seg.end_index is None:
+                    continue
+                supports.append({"part": seg.part_index or 0, "start": seg.start_index or 0, "end": seg.end_index,
+                                 "chunks": list(s.grounding_chunk_indices or [])})
+            queries = list(gm.web_search_queries or [])
+            if gm.search_entry_point and gm.search_entry_point.rendered_content:
+                entry_html = gm.search_entry_point.rendered_content
+        usage = getattr(response, "usage_metadata", None)
+        meta = {
+            "model_version": getattr(response, "model_version", None),
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "input_tokens": getattr(usage, "prompt_token_count", None),
+            "output_tokens": getattr(usage, "candidates_token_count", None),
+            "used_fallback": False,
+        }
+        return {"parts": parts, "chunks": chunks, "supports": supports, "queries": queries, "entry_html": entry_html}, meta
+
+    def generate_grounded(self, model, system, prompt, fallback_model=None):
+        """Prose answer grounded with Google Search. Returns (grounding, meta); grounding has the text parts and the
+        sources/supports exactly as Google returned them (segment offsets are UTF-8 byte offsets within a part)."""
+        if not self.configured():
+            raise ProviderError("GEMINI_API_KEY is not set on the server.", kind="not_configured")
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=settings.GEMINI_API_KEY, http_options=types.HttpOptions(timeout=self.GROUNDED_TIMEOUT_MS))
+        try:
+            return self._grounded(client, model, system, prompt)
+        except Exception as exc:  # noqa: BLE001
+            err = exc if isinstance(exc, ProviderError) else self._translate(exc)
+        if err.kind in ("overloaded", "timeout") and fallback_model and fallback_model != model:
+            try:
+                grounding, meta = self._grounded(client, fallback_model, system, prompt)
+                meta["used_fallback"] = True
+                return grounding, meta
+            except Exception:  # noqa: BLE001 - report the original failure
+                pass
+        if err.kind == "rate_limited":
+            err = ProviderError("Gemini refused the web-search request: quota reached for this key. Grounding with Google "
+                                "Search usually needs billing enabled on the key's Google Cloud project (AI Studio → Billing).",
+                                "rate_limited", err.status)
         raise err
