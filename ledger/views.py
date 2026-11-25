@@ -300,3 +300,34 @@ class RateTestView(APIView):
                                                     f"{' on ' + wanted.isoformat() if wanted else ''}."})
         return Response({"ok": True, "base": base, "quote": quote, "rate": f"{found['rate']:.8f}".rstrip("0").rstrip("."),
                          "date": found["date"], "provider": key})
+
+
+class PlanExportView(APIView):
+    """GET /api/plans/export/?ids=1,2&as=pdf|xlsx -> the chosen plans as a PDF statement or an Excel workbook.
+    Only the signed-in user's plans can be exported; any id that isn't theirs makes the whole request 404."""
+
+    FORMATS = {"pdf": ("application/pdf", "pdf"),
+               "xlsx": ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx")}
+
+    def get(self, request):
+        from .export import filename, to_pdf, to_xlsx
+
+        fmt = request.query_params.get("as", "pdf")  # not "format": DRF reserves it for renderer negotiation
+        if fmt not in self.FORMATS:
+            return Response({"detail": "as must be pdf or xlsx"}, status=400)
+        try:
+            ids = list(dict.fromkeys(int(x) for x in request.query_params.get("ids", "").split(",") if x.strip()))
+        except ValueError:
+            return Response({"detail": "ids must be plan ids separated by commas"}, status=400)
+        if not ids or len(ids) > 50:
+            return Response({"detail": "Choose between 1 and 50 plans."}, status=400)
+        found = {p.id: p for p in Plan.objects.filter(user=request.user, id__in=ids).prefetch_related("payments")}
+        if len(found) != len(ids):
+            return Response({"detail": "Plan not found."}, status=404)
+        plans = [found[i] for i in ids]  # keep the order the user chose
+        content_type, ext = self.FORMATS[fmt]
+        body = to_pdf(plans) if fmt == "pdf" else to_xlsx(plans)
+        res = HttpResponse(body, content_type=content_type)
+        res["Content-Disposition"] = f'attachment; filename="{filename(plans, ext, date.today())}"'
+        res["Cache-Control"] = "no-store"
+        return res

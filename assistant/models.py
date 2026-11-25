@@ -43,3 +43,36 @@ class AIInteraction(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+
+
+class PlannerChat(models.Model):
+    """One conversation with the AI planner (the panel's "Old chats"). Owned by one user; never shared."""
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="planner_chats")
+    title = models.CharField(max_length=120)
+    page = models.CharField(max_length=40, blank=True, help_text="Screen the chat was started from, e.g. Invest")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-updated_at", "-id"]
+
+    def __str__(self):
+        return f"{self.user} · {self.title}"
+
+
+class PlannerMessage(models.Model):
+    """A turn in a planner chat. `out` is the validated planner response (same shape the API returned), so an old
+    chat re-renders exactly as it was answered, with the figures as of that day."""
+
+    ROLES = (("user", "User"), ("ai", "AI"), ("error", "Error"))
+    chat = models.ForeignKey(PlannerChat, on_delete=models.CASCADE, related_name="messages")
+    role = models.CharField(max_length=10, choices=ROLES)
+    text = models.TextField(blank=True)  # the question, or the error shown
+    question = models.CharField(max_length=500, blank=True)  # for ai/error: the question it answers (retry)
+    out = models.JSONField(null=True, blank=True)
+    error_kind = models.CharField(max_length=30, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]

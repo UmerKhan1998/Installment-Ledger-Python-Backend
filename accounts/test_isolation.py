@@ -13,6 +13,7 @@ from PIL import Image
 from rest_framework.test import APITestCase
 
 from expenses.models import Expense, ExpenseSettings, GlobalBudget, MonthBudget, MonthlyRate, Project, ProjectExpense
+from assistant.models import PlannerChat, PlannerMessage
 from finance.models import FinancialProfile, Goal
 from ledger.models import Payment, Plan
 
@@ -61,6 +62,8 @@ class CrossUserIsolationTests(APITestCase):
                            {"title": "A's venue", "amount": "100000", "category": "Venue", "spent_on": "2026-11-02"}, format="json").data
         self.goal = c.post("/api/finance/goals/", {"name": "A's goal", "target_amount": "777777", "target_date": "2028-01-01"}, format="json").data
         c.patch("/api/finance/profile/", {"monthly_income": "123456", "consent_use_ledger": True}, format="json")
+        self.chat = PlannerChat.objects.create(user_id=self.a, title="A's private question", page="Invest")
+        PlannerMessage.objects.create(chat=self.chat, role="user", text="A's private question")
         self.counts = self.snapshot()
 
         # ---- user B ----
@@ -81,12 +84,14 @@ class CrossUserIsolationTests(APITestCase):
             "project_name": Project.objects.get(pk=self.project["id"]).name,
             "goal_name": Goal.objects.get(pk=self.goal["id"]).name,
             "income": FinancialProfile.objects.get(user_id=self.a).monthly_income,
+            "chats": list(PlannerChat.objects.filter(user_id=self.a).values_list("title", flat=True)),
+            "chat_messages": PlannerMessage.objects.filter(chat__user_id=self.a).count(),
         }
 
     def ids(self):
         return {"pk_plan": self.plan["id"], "plan_id": self.plan["id"], "pk_payment": self.payment["id"],
                 "pk_expense": self.expense["id"], "project_id": self.project["id"], "pk_project": self.project["id"],
-                "pk_pexp": self.pexp["id"], "pk_goal": self.goal["id"]}
+                "pk_pexp": self.pexp["id"], "pk_goal": self.goal["id"], "pk_chat": self.chat.id}
 
     def object_urls(self):
         """Every route with an id, filled with user A's ids."""
@@ -103,6 +108,7 @@ class CrossUserIsolationTests(APITestCase):
             "api/expenses/projects/<int:project_id>/expenses/<int:pk>/": f"/api/expenses/projects/{i['project_id']}/expenses/{i['pk_pexp']}/",
             "api/expenses/projects/<int:project_id>/expenses/bulk-delete/": f"/api/expenses/projects/{i['project_id']}/expenses/bulk-delete/",
             "api/finance/goals/<int:pk>/": f"/api/finance/goals/{i['pk_goal']}/",
+            "api/ai/chats/<int:pk>/": f"/api/ai/chats/{i['pk_chat']}/",
         }
 
     def test_every_id_route_is_covered(self):
@@ -126,7 +132,7 @@ class CrossUserIsolationTests(APITestCase):
                     "/api/expenses/projects/", "/api/expenses/settings/", "/api/expenses/budget/?month=2026-11",
                     "/api/expenses/rates/?month=2026-11", "/api/expenses/rates/history/?months=24", "/api/auth/me/",
                     "/api/payments/duplicate-check/?reference=REF-A-1", "/api/finance/profile/", "/api/finance/assessment/",
-                    "/api/finance/goals/", "/api/ai/settings/"):
+                    "/api/finance/goals/", "/api/ai/settings/", "/api/ai/chats/", "/api/ai/chats/?q=private"):
             res = c.get(url)
             self.assertEqual(res.status_code, 200, url)
             body = res.content.decode()
@@ -153,6 +159,9 @@ class CrossUserIsolationTests(APITestCase):
                                       "first_payment_date": "2026-10-01"}, format="json").data
         res = c.post(f"/api/plans/{mine['id']}/payments/", {"amount": "10", "paid_on": "2026-10-02", "reference": "REF-A-1"}, format="json")
         self.assertEqual(res.status_code, 201, res.data)
+        # continue A's chat from B's account
+        res = c.post("/api/ai/planner/", {"question": "hi", "chat_id": self.chat.id}, format="json")
+        self.assertEqual(res.status_code, 404)
         self.assertEqual(self.snapshot(), self.counts)
 
     def test_unauthenticated_requests_get_nothing(self):

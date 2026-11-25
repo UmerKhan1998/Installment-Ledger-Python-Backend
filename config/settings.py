@@ -142,6 +142,7 @@ CORS_ALLOWED_ORIGINS = [
 ]
 # Regexes for changing hostnames, e.g. Vercel preview deployments: ^https://installment-ledger[a-z0-9-]*\.vercel\.app$
 CORS_ALLOWED_ORIGIN_REGEXES = env_list("CORS_ALLOWED_ORIGIN_REGEXES")
+CORS_EXPOSE_HEADERS = ["Content-Disposition"]  # lets the browser read export file names cross-origin
 CSRF_TRUSTED_ORIGINS = [f"https://{RENDER_HOST}"] if RENDER_HOST else []
 
 if not DEBUG:

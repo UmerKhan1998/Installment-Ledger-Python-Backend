@@ -127,22 +127,72 @@ class AITestView(APIView):
 
 
 class PlannerView(APIView):
-    """POST /api/ai/planner/ {"question"?, "history"?: [{q, a}]} -> AI answer about the user's calculated plan
-    (consent required, throttled). No question = explain the whole plan."""
+    """POST /api/ai/planner/ {"question"?, "chat_id"?, "page"?} -> AI answer about the user's calculated plan
+    (consent required, throttled). No question = explain the whole plan. Each turn is saved in a chat ("Old chats"):
+    without chat_id a new chat is started; with it, earlier turns of that chat are the follow-up context."""
 
     throttle_scope = "ai_planner"
 
     def post(self, request):
-        from .planner import BadQuestion, ConsentRequired, run_planner
+        from .chats import chat_summary, run_chat_turn
+        from .models import PlannerChat
+        from .planner import BadQuestion, ConsentRequired
 
+        chat = None
+        if request.data.get("chat_id") not in (None, ""):
+            try:
+                chat = PlannerChat.objects.get(pk=int(request.data["chat_id"]), user=request.user)
+            except (PlannerChat.DoesNotExist, TypeError, ValueError):
+                return Response({"detail": "Chat not found."}, status=404)
         try:
-            return Response(run_planner(request.user, request.data.get("question"), request.data.get("history")))
+            out, chat = run_chat_turn(request.user, request.data.get("question"), chat, request.data.get("page", ""))
         except BadQuestion as exc:
             return Response({"detail": str(exc)}, status=400)
         except ConsentRequired as exc:
             return Response({"detail": str(exc), "kind": "consent_required"}, status=403)
         except ProviderError as err:
-            return error_response(err)
+            res = error_response(err)
+            if getattr(err, "chat", None) and err.chat.pk:
+                res.data["chat"] = chat_summary(err.chat)
+            return res
+        return Response({**out, "chat": chat_summary(chat)})
+
+
+class PlannerChatsView(APIView):
+    """GET /api/ai/chats/?q=&period=7d|30d|90d&page=Invest -> the user's planner chats, newest first (max 100)."""
+
+    def get(self, request):
+        from .chats import chat_summary, search
+        from .models import PlannerChat
+
+        p = request.query_params
+        chats = search(request.user, p.get("q", ""), p.get("period", ""), p.get("page", ""))[:100]
+        pages = sorted(set(PlannerChat.objects.filter(user=request.user).exclude(page="").values_list("page", flat=True)))
+        return Response({"chats": [chat_summary(c) for c in chats], "pages": pages})
+
+
+class PlannerChatDetailView(APIView):
+    """GET /api/ai/chats/{id}/ -> the chat with its messages; DELETE removes it. Only the owner's chats exist here."""
+
+    def _chat(self, request, pk):
+        from .models import PlannerChat
+
+        return PlannerChat.objects.filter(pk=pk, user=request.user).first()
+
+    def get(self, request, pk):
+        from .chats import chat_summary, message_dict
+
+        chat = self._chat(request, pk)
+        if not chat:
+            return Response({"detail": "Chat not found."}, status=404)
+        return Response({**chat_summary(chat), "messages": [message_dict(m) for m in chat.messages.all()]})
+
+    def delete(self, request, pk):
+        chat = self._chat(request, pk)
+        if not chat:
+            return Response({"detail": "Chat not found."}, status=404)
+        chat.delete()
+        return Response(status=204)
 
 
 class OpportunitiesView(APIView):
