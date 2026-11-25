@@ -158,7 +158,7 @@ FIREBASE_SERVICE_ACCOUNT_B64 = os.getenv("FIREBASE_SERVICE_ACCOUNT_B64", "")
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
         "accounts.firebase_auth.FirebaseAuthentication",
-        "rest_framework_simplejwt.authentication.JWTAuthentication",
+        "accounts.security.LegacyJWTAuthentication",
     ),
     "DEFAULT_PERMISSION_CLASSES": ("rest_framework.permissions.IsAuthenticated",),
 }

@@ -24,6 +24,7 @@ from google.auth import jwt as google_jwt
 from rest_framework import authentication, exceptions
 
 from .models import FirebaseIdentity
+from .security import lock_to_firebase
 
 CERTS_URL = "https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com"
 CERTS_CACHE_KEY = "firebase:securetoken:certs"
@@ -86,6 +87,8 @@ def user_for_claims(claims):
             elif hasattr(user, "firebase"):
                 raise exceptions.AuthenticationFailed("This email is already linked to another sign-in. Use that one.")
             FirebaseIdentity.objects.create(user=user, uid=uid, email=email, sign_in_provider=provider)
+            # From now on only Firebase opens this account (see accounts/security.py).
+            lock_to_firebase(user)
     except IntegrityError:
         # Another request linked this uid at the same moment.
         return FirebaseIdentity.objects.select_related("user").get(uid=uid).user

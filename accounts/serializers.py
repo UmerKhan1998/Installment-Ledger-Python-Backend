@@ -3,6 +3,8 @@ from django.contrib.auth.password_validation import validate_password
 from rest_framework import serializers
 from rest_framework_simplejwt.tokens import RefreshToken
 
+from .security import FIREBASE_ONLY
+
 User = get_user_model()
 
 
@@ -49,7 +51,11 @@ class LoginSerializer(serializers.Serializer):
     password = serializers.CharField(write_only=True)
 
     def validate(self, attrs):
-        user = authenticate(username=attrs["email"].strip().lower(), password=attrs["password"])
+        email = attrs["email"].strip().lower()
+        linked = User.objects.filter(username=email, firebase__isnull=False).exists()
+        if linked:
+            raise serializers.ValidationError(FIREBASE_ONLY)
+        user = authenticate(username=email, password=attrs["password"])
         if not user or not user.is_active:
             raise serializers.ValidationError("Email or password is incorrect.")
         attrs["user"] = user

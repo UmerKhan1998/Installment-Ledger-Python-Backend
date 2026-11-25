@@ -100,3 +100,49 @@ class FirebaseAuthTests(APITestCase):
     @override_settings(FIREBASE_PROJECT_ID="")
     def test_not_configured(self):
         self.assertEqual(self.me(firebase_token()).status_code, 401)
+
+
+@override_settings(FIREBASE_PROJECT_ID=PROJECT)
+class AccountBindingTests(APITestCase):
+    """Once an account is linked to Firebase, only Firebase opens it (no leftover Django password or tokens)."""
+
+    def setUp(self):
+        patcher = mock.patch("accounts.firebase_auth._google_certs", return_value=CERTS)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_squatter_loses_access_when_real_owner_signs_in(self):
+        # Someone registers a Django account with the victim's email (Django never verified emails)...
+        squat = self.client.post("/api/auth/register/", {"email": "victim@example.com", "password": "Squatter-pass1"}, format="json").data
+        # ...the real owner signs in with Google (verified email) and the account gets linked.
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {firebase_token(uid='victim-g', email='victim@example.com', provider='google.com')}")
+        self.assertEqual(self.client.get("/api/auth/me/").status_code, 200)
+        self.client.post("/api/plans/", {"item": "Victim's private plan", "purchase_price": "1", "total_amount": "10", "months": 12,
+                                         "first_payment_date": "2026-11-01"}, format="json")
+        # The squatter's password, access token and refresh token are all dead now.
+        self.client.credentials()
+        login = self.client.post("/api/auth/login/", {"email": "victim@example.com", "password": "Squatter-pass1"}, format="json")
+        self.assertEqual(login.status_code, 400)
+        self.assertIn("Google / Firebase", str(login.data))
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {squat['access']}")
+        self.assertEqual(self.client.get("/api/plans/").status_code, 401)
+        self.client.credentials()
+        self.assertEqual(self.client.post("/api/auth/refresh/", {"refresh": squat["refresh"]}, format="json").status_code, 401)
+        self.assertFalse(get_user_model().objects.get(username="victim@example.com").has_usable_password())
+
+    def test_unlinked_accounts_keep_django_login(self):
+        self.client.post("/api/auth/register/", {"email": "plain@example.com", "password": "Plain-pass1!"}, format="json")
+        res = self.client.post("/api/auth/login/", {"email": "plain@example.com", "password": "Plain-pass1!"}, format="json")
+        self.assertEqual(res.status_code, 200)
+
+    def test_two_firebase_users_never_see_each_other(self):
+        alice = firebase_token(uid="alice-uid", email="alice@example.com")
+        bob = firebase_token(uid="bob-uid", email="bob@example.com")
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {alice}")
+        plan = self.client.post("/api/plans/", {"item": "Alice plan", "purchase_price": "1", "total_amount": "10", "months": 12,
+                                                "first_payment_date": "2026-11-01"}, format="json").data
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {bob}")
+        self.assertEqual(self.client.get("/api/plans/").data, [])
+        self.assertEqual(self.client.get(f"/api/plans/{plan['id']}/").status_code, 404)
+        self.assertEqual(self.client.delete(f"/api/plans/{plan['id']}/").status_code, 404)
+        self.assertNotEqual(self.client.get("/api/auth/me/").data["email"], "alice@example.com")
