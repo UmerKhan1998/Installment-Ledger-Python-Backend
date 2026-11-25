@@ -131,3 +131,43 @@ class GeminiProvider(LLMProvider):
             except Exception:  # noqa: BLE001 - report the original failure
                 pass
         raise err
+
+    def _structured(self, client, model, system, prompt, schema):
+        from google.genai import types
+
+        started = time.monotonic()
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                response_mime_type="application/json",
+                response_schema=schema,
+                temperature=0.2,
+                max_output_tokens=4096,
+            ),
+        )
+        usage = getattr(response, "usage_metadata", None)
+        meta = {
+            "model_version": getattr(response, "model_version", None),
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "input_tokens": getattr(usage, "prompt_token_count", None),
+            "output_tokens": getattr(usage, "candidates_token_count", None),
+            "used_fallback": False,
+        }
+        return response.text or "", meta
+
+    def generate_json(self, model, system, prompt, schema, fallback_model=None):
+        client = self._client()
+        try:
+            return self._structured(client, model, system, prompt, schema)
+        except Exception as exc:  # noqa: BLE001
+            err = exc if isinstance(exc, ProviderError) else self._translate(exc)
+        if err.kind in ("overloaded", "timeout") and fallback_model and fallback_model != model:
+            try:
+                text, meta = self._structured(client, fallback_model, system, prompt, schema)
+                meta["used_fallback"] = True
+                return text, meta
+            except Exception:  # noqa: BLE001 - report the original failure
+                pass
+        raise err

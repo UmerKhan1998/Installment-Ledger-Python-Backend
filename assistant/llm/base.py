@@ -59,3 +59,8 @@ class LLMProvider:
 
     def test(self, model: str, fallback_model: str | None = None) -> TestResult:
         raise NotImplementedError
+
+    def generate_json(self, model: str, system: str, prompt: str, schema, fallback_model: str | None = None):
+        """Structured generation. Returns (text, meta) where meta has model_version, used_fallback,
+        latency_ms, input_tokens, output_tokens. The caller validates `text` against `schema`."""
+        raise NotImplementedError

@@ -13,6 +13,7 @@ from PIL import Image
 from rest_framework.test import APITestCase
 
 from expenses.models import Expense, ExpenseSettings, GlobalBudget, MonthBudget, MonthlyRate, Project, ProjectExpense
+from finance.models import FinancialProfile, Goal
 from ledger.models import Payment, Plan
 
 PASSWORD = "Sup3r-secret!"
@@ -58,7 +59,10 @@ class CrossUserIsolationTests(APITestCase):
         self.project = c.post("/api/expenses/projects/", {"name": "A's wedding", "template": "wedding", "budget": "500000"}, format="json").data
         self.pexp = c.post(f"/api/expenses/projects/{self.project['id']}/expenses/",
                            {"title": "A's venue", "amount": "100000", "category": "Venue", "spent_on": "2026-11-02"}, format="json").data
+        self.goal = c.post("/api/finance/goals/", {"name": "A's goal", "target_amount": "777777", "target_date": "2028-01-01"}, format="json").data
+        c.patch("/api/finance/profile/", {"monthly_income": "123456", "consent_use_ledger": True}, format="json")
         self.counts = self.snapshot()
+
         # ---- user B ----
         self.b = self.login("bob@example.com")
 
@@ -75,12 +79,14 @@ class CrossUserIsolationTests(APITestCase):
             "plan_item": Plan.objects.get(pk=self.plan["id"]).item,
             "expense_title": Expense.objects.get(pk=self.expense["id"]).title,
             "project_name": Project.objects.get(pk=self.project["id"]).name,
+            "goal_name": Goal.objects.get(pk=self.goal["id"]).name,
+            "income": FinancialProfile.objects.get(user_id=self.a).monthly_income,
         }
 
     def ids(self):
         return {"pk_plan": self.plan["id"], "plan_id": self.plan["id"], "pk_payment": self.payment["id"],
                 "pk_expense": self.expense["id"], "project_id": self.project["id"], "pk_project": self.project["id"],
-                "pk_pexp": self.pexp["id"]}
+                "pk_pexp": self.pexp["id"], "pk_goal": self.goal["id"]}
 
     def object_urls(self):
         """Every route with an id, filled with user A's ids."""
@@ -96,6 +102,7 @@ class CrossUserIsolationTests(APITestCase):
             "api/expenses/projects/<int:project_id>/expenses/": f"/api/expenses/projects/{i['project_id']}/expenses/",
             "api/expenses/projects/<int:project_id>/expenses/<int:pk>/": f"/api/expenses/projects/{i['project_id']}/expenses/{i['pk_pexp']}/",
             "api/expenses/projects/<int:project_id>/expenses/bulk-delete/": f"/api/expenses/projects/{i['project_id']}/expenses/bulk-delete/",
+            "api/finance/goals/<int:pk>/": f"/api/finance/goals/{i['pk_goal']}/",
         }
 
     def test_every_id_route_is_covered(self):
@@ -114,11 +121,12 @@ class CrossUserIsolationTests(APITestCase):
 
     def test_b_sees_none_of_a_data_in_lists_and_summaries(self):
         c = self.client
-        a_markers = ("A's", "REF-A-1", "99999", "500000", "40000")
+        a_markers = ("A's", "REF-A-1", "99999", "500000", "40000", "777777", "123456")
         for url in ("/api/plans/", "/api/summary/", "/api/expenses/?month=2026-11", "/api/expenses/summary/?month=2026-11",
                     "/api/expenses/projects/", "/api/expenses/settings/", "/api/expenses/budget/?month=2026-11",
                     "/api/expenses/rates/?month=2026-11", "/api/expenses/rates/history/?months=24", "/api/auth/me/",
-                    "/api/payments/duplicate-check/?reference=REF-A-1"):
+                    "/api/payments/duplicate-check/?reference=REF-A-1", "/api/finance/profile/", "/api/finance/assessment/",
+                    "/api/finance/goals/", "/api/ai/settings/"):
             res = c.get(url)
             self.assertEqual(res.status_code, 200, url)
             body = res.content.decode()

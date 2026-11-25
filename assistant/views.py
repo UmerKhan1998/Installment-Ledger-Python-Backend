@@ -124,3 +124,19 @@ class AITestView(APIView):
             prefs.last_test_message = result.message[:300]
             prefs.save()
         return Response(result.as_dict())
+
+
+class PlannerView(APIView):
+    """POST /api/ai/planner/ -> AI explanation of the user's calculated plan (consent required, throttled)."""
+
+    throttle_scope = "ai_planner"
+
+    def post(self, request):
+        from .planner import ConsentRequired, run_planner
+
+        try:
+            return Response(run_planner(request.user))
+        except ConsentRequired as exc:
+            return Response({"detail": str(exc), "kind": "consent_required"}, status=403)
+        except ProviderError as err:
+            return error_response(err)

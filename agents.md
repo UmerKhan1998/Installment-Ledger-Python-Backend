@@ -553,6 +553,8 @@ This file is the persistent project-level memory. Every coding agent must follow
 | 2026-11-25 | Owner chose to use the Gemini key that was shared in chat (stored only in gitignored `backend/.env`) | Owner decision; rotation still recommended — keep §18 item 10 open | Accepted by owner |
 | 2026-11-25 | AI provider layer lives in a new `assistant` app (`assistant/llm/`: `base.py` interface, `gemini.py` via official `google-genai`, `registry.py`), not `integrations/llm/` | Follows the flat app layout; same separation as §21 suggests | Accepted |
 | 2026-11-25 | Per-user model choice (`assistant.AISettings`); the API key stays a server secret — the UI shows only "configured" + last 4 chars and never accepts a key | §21: never expose credentials to the frontend | Accepted |
+| 2026-11-25 | Planner surplus rules `surplus-v1`: 10% buffer of free cash flow; emergency gap (months × outgoings − savings) closed over 12 months; goals due ≤36 months funded from savings; remainder = investable. Unknown savings ⇒ treated as 0 (cautious) and flagged | Conservative, explainable, configurable (§3 Phase 1, §7). Constants in `finance/calculations.py`; bump `METHOD_VERSION` on change | Accepted |
+| 2026-11-25 | Phase 1 planner is **education/decision support only**: AI explains app-calculated figures, recommends no products, makes no return claims | No licensed market data yet; SECP licensing not reviewed (§12, §20) | Accepted (default; owner may revise after legal review) |
 | 2026-11-25 | The Gemini key shared in chat is treated as compromised (§21) | Must be rotated/restricted before real use; never stored in files | Open (owner action) |
 | 2026-11-25 | Canonical `agents.md` lives in the backend repo; root `agents.md` is a symlink; `CLAUDE.md` files import it | The parent folder is not a git repo; one versioned copy, no divergent copies | Accepted |
 
@@ -560,8 +562,8 @@ This file is the persistent project-level memory. Every coding agent must follow
 
 As of 2026-11-24, the following is a **proposed blueprint**, not confirmation that it exists in the repository:
 - [x] Repo audit completed; existing Installment Ledger architecture documented. _(2026-11-25 — see §24; no code changed during the audit.)_
-- [ ] Financial profile and consent models implemented.
-- [ ] Investable-surplus calculator implemented and tested.
+- [x] Financial profile and consent models implemented. _(2026-11-25: `finance.FinancialProfile` with purpose-specific consents `consent_use_ledger`, `consent_ai` + `consent_updated_at`.)_
+- [x] Investable-surplus calculator implemented and tested. _(2026-11-25: `finance/calculations.py`, method `surplus-v1`; `finance/assessment.py` reads Plans/Expenses only with consent.)_
 - [ ] Risk questionnaire/scoring versioning implemented and validated.
 - [ ] Asset/fund registry implemented.
 - [ ] Provider adapters and data licenses reviewed.
@@ -581,6 +583,7 @@ Already in the repository before this blueprint (verified 2026-11-25):
 - [x] Receipt storage abstraction for Firebase Storage (`ledger/receipt_storage.py`) — **inactive until a service account is configured**.
 - [x] Exchange-rate provider adapters with fallback and provenance (`ledger/rates.py`) — the pattern to reuse for market-data adapters.
 - [ ] Rate limiting, structured logging, shared cache (Redis), CI — not present.
+- [x] (2026-11-25) **Investment planner, Phase 1 slice (education only).** Backend `finance` app: `FinancialProfile`, `Goal`; `calculations.py` (Decimal; `required_monthly` 0%-growth and illustrative-return PMT; `surplus` waterfall: free cash flow → 10% buffer → emergency top-up (gap over 12 months) → near-term goals (≤36 months) → investable); `assessment.py` (ledger spending = average of last 3 complete months of Expenses with data, converted via stored monthly rates; installments = monthly amount of unfinished Plans at this month's rate). Endpoints `GET|PATCH /api/finance/profile/`, `GET /api/finance/assessment/`, `GET|POST /api/finance/goals/`, `GET|PATCH|DELETE /api/finance/goals/{id}/`. AI planner `POST /api/ai/planner/` (`assistant/planner.py`, prompt `assistant/prompts/planner_v2.py`): consent-gated; sends only aggregate figures with ids + display strings (no plan/goal names, no email); structured output (`PlannerAnswer` Pydantic schema) validated server-side — unknown figure ids dropped, numbers not matching a sent figure flagged, links stripped; every call audited in `assistant.AIInteraction` (prompt/method version, model requested/served, tokens, latency, figure ids + hash, validated answer, warnings); throttle scope `ai_planner` (`AI_PLANNER_RATE`, default 10/hour). Frontend: **Invest** tab (`pages/Invest.jsx`): consent card, "Your numbers", surplus waterfall with source badges (`components/DataBadge.jsx`) and "How this is calculated", goals with 0% and illustrative-return columns, AI planner card (AI-explanation badge, figure chips per section, warnings, model/version/prompt/method footer, disclaimer). Tests: `finance/tests.py`, planner tests in `assistant/tests.py`, isolation extended to goals/profile/assessment. Live check: real Gemini run, all amounts matched calculated figures, 0 warnings. No product recommendations, no market data yet.
 - [x] (2026-11-25) Gemini provider adapter (`assistant/llm/gemini.py`, `google-genai` 3.6.1): list text models, test connection with overload fallback, safe error translation (no key in messages/logs; logs exception type + status only), 20 s timeout. Profile → **AI provider** UI: load models, choose model (validated against the listed set), test, save. Endpoints `GET|PATCH /api/ai/settings/`, `GET /api/ai/models/[?refresh=1]` (cached 30 min), `POST /api/ai/test/` (DRF `ScopedRateThrottle`, scope `ai_test`, default 20/hour). Tests: `assistant/tests.py` (12). Full suite 122 passing (SQLite). Verified live: 14 text models listed; `gemini-3.5-flash` answered as `gemini-3.6-flash`.
 
 ## 18. Known issues / next steps
@@ -602,6 +605,7 @@ Added 2026-11-25 (from the audit):
 13. **Mobile repo** (`mobile/`) has only Expo's initial commit and no remote — commit and push it; it still uses Django JWT login, which no longer works for Firebase-linked accounts.
 14. Income, savings/assets and non-installment debts are **not captured anywhere** today; the investable-surplus calculator cannot be computed from ledger data alone.
 15. Google lists some models the key cannot use (e.g. `gemini-2.5-flash` → 404 "no longer available to new users"); the UI asks users to test before saving. Model aliases (`gemini-flash-latest`) appear/disappear and Google may redirect names (`gemini-3.5-flash` served by `gemini-3.6-flash`) — always record the returned `modelVersion`.
+17. Planner limitations: income is user-entered only; spending average ignores months with no expenses (flagged); goal currencies are converted at this month's rate; risk questionnaire, market data, portfolio and RAG are not built yet (Phases 2–5). Shared CSS gotcha: `.table td:first-child` is `nowrap` globally — tables with long first-column text must override it (done for `.waterfall`).
 16. `google-genai` gotcha: keep the `genai.Client` referenced while consuming `models.list()`; a temporary client is garbage-collected and closes its HTTP connection mid-pagination (`RuntimeError`). Fixed in `GeminiProvider.list_models`.
 
 ## 19. Authoritative reference links
@@ -789,7 +793,7 @@ Read-only audit; no code changed. Re-verify before relying on details — the re
 
 **Gaps:** no income, savings/assets, non-installment liabilities, risk profile, consent records, audit log, background jobs, rate limiting, logging, CI.
 
-**Environment variables in use (names only):** `DJANGO_SECRET_KEY`, `DJANGO_DEBUG`, `DJANGO_ALLOWED_HOSTS`, `CORS_ALLOWED_ORIGINS`, `CORS_ALLOWED_ORIGIN_REGEXES`, `DATABASE_URL`, `USE_SQLITE`, `JWT_ACCESS_MINUTES`, `JWT_REFRESH_DAYS`, `FIREBASE_PROJECT_ID`, `FIREBASE_STORAGE_BUCKET`, `FIREBASE_SERVICE_ACCOUNT_FILE`, `FIREBASE_SERVICE_ACCOUNT_B64`; frontend `VITE_API_URL`, `VITE_FIREBASE_*`; mobile `EXPO_PUBLIC_API_URL`. Gemini (configured 2026-11-25): `GEMINI_API_KEY`, `GEMINI_MODEL`, `GEMINI_FALLBACK_MODEL`, `GEMINI_EMBEDDING_MODEL`, `AI_TEST_RATE` (throttle for `/api/ai/test/`).
+**Environment variables in use (names only):** `DJANGO_SECRET_KEY`, `DJANGO_DEBUG`, `DJANGO_ALLOWED_HOSTS`, `CORS_ALLOWED_ORIGINS`, `CORS_ALLOWED_ORIGIN_REGEXES`, `DATABASE_URL`, `USE_SQLITE`, `JWT_ACCESS_MINUTES`, `JWT_REFRESH_DAYS`, `FIREBASE_PROJECT_ID`, `FIREBASE_STORAGE_BUCKET`, `FIREBASE_SERVICE_ACCOUNT_FILE`, `FIREBASE_SERVICE_ACCOUNT_B64`; frontend `VITE_API_URL`, `VITE_FIREBASE_*`; mobile `EXPO_PUBLIC_API_URL`. Gemini (configured 2026-11-25): `GEMINI_API_KEY`, `GEMINI_MODEL`, `GEMINI_FALLBACK_MODEL`, `GEMINI_EMBEDDING_MODEL`, `AI_TEST_RATE` (throttle for `/api/ai/test/`), `AI_PLANNER_RATE` (throttle for `/api/ai/planner/`).
 
 ---
 

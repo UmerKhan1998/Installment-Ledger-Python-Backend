@@ -1,3 +1,4 @@
+import json
 from unittest import mock
 
 from django.core.cache import cache
@@ -143,3 +144,88 @@ class GeminiProviderTests(APITestCase):
         with mock.patch.object(GeminiProvider, "_client", return_value=fake):
             got = [(m.id, m.stage) for m in GeminiProvider().list_models()]
         self.assertEqual(got, [("gemini-3.5-flash", "stable"), ("gemini-omni-flash-preview", "preview")])
+
+
+@override_settings(GEMINI_API_KEY=SECRET, GEMINI_MODEL="gemini-3.5-flash", GEMINI_FALLBACK_MODEL="gemini-3.5-flash-lite")
+class PlannerTests(APITestCase):
+    def setUp(self):
+        cache.clear()  # throttle history lives in the cache
+        res = self.client.post("/api/auth/register/", {"email": "planner-person@example.com", "password": "Sup3r-secret!"}, format="json")
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {res.data['access']}")
+        self.client.post("/api/plans/", {"item": "Secret MacBook Plan", "purchase_price": "1199", "total_amount": "1350", "months": 18,
+                                         "first_payment_date": "2026-09-01", "currency": "PKR"}, format="json")
+        self.client.post("/api/finance/goals/", {"name": "Private wedding of Ayesha", "kind": "short_term", "target_amount": "1200000",
+                                                 "target_date": "2027-11-25"}, format="json")
+        self.client.patch("/api/finance/profile/", {"monthly_income": "300000", "cash_savings": "500000",
+                                                    "monthly_expenses_override": "150000", "consent_use_ledger": True}, format="json")
+        self.sent = {}
+
+    def fake_generate(self, answer):
+        def generate(model, system, prompt, schema, fallback_model=None):
+            self.sent.update(model=model, system=system, prompt=prompt)
+            return json.dumps(answer), {"model_version": "gemini-3.6-flash", "latency_ms": 1200, "input_tokens": 900,
+                                        "output_tokens": 300, "used_fallback": False}
+        return generate
+
+    def run_planner(self, answer):
+        from .llm.gemini import GeminiProvider
+        with mock.patch.object(GeminiProvider, "generate_json", side_effect=self.fake_generate(answer)):
+            return self.client.post("/api/ai/planner/", {}, format="json")
+
+    def test_consent_required(self):
+        res = self.run_planner({"summary": "x"})
+        self.assertEqual((res.status_code, res.data["kind"]), (403, "consent_required"))
+        self.assertEqual(self.sent, {})  # nothing was sent
+
+    def test_answer_validated_and_names_never_sent(self):
+        self.client.patch("/api/finance/profile/", {"consent_ai": True}, format="json")
+        answer = {
+            "summary": "You keep 129,250.00 free each month and can set aside 37,621.25.",
+            "sections": [
+                {"title": "Cash flow", "text": "Income 300,000.00 minus spending 150,000.00.", "figure_ids": ["income", "expenses", "made_up"]},
+                {"title": "Invest", "text": "Markets returned 18% so put 999,999 into ABC Fund, see https://evil.example", "figure_ids": ["investable"]},
+            ],
+            "next_steps": ["Build the emergency fund."],
+            "caveats": ["Estimates only."],
+        }
+        res = self.run_planner(answer)
+        self.assertEqual(res.status_code, 200, res.data)
+        sec = res.data["answer"]["sections"]
+        self.assertEqual(sec[0]["figure_ids"], ["income", "expenses"])           # unknown id dropped
+        self.assertIn("[link removed]", sec[1]["text"])
+        warnings = " ".join(res.data["warnings"])
+        self.assertIn("made_up", warnings)
+        self.assertIn("999,999", warnings)                                       # number not from the app
+        self.assertNotIn("300,000.00", warnings)                                  # real figures pass
+        self.assertEqual(res.data["model_version"], "gemini-3.6-flash")
+        # Data minimisation: no plan/goal names or email in what was sent
+        for private in ("Secret MacBook Plan", "Private wedding of Ayesha", "Ayesha", "planner-person@example.com"):
+            self.assertNotIn(private, self.sent["prompt"])
+        self.assertIn('"income"', self.sent["prompt"])
+        self.assertIn("not a licensed financial adviser", self.sent["system"])
+
+    def test_interaction_is_audited(self):
+        from .models import AIInteraction
+        self.client.patch("/api/finance/profile/", {"consent_ai": True}, format="json")
+        self.run_planner({"summary": "ok", "sections": [], "next_steps": [], "caveats": []})
+        rec = AIInteraction.objects.get()
+        self.assertEqual((rec.kind, rec.prompt_version, rec.method_version, rec.model_version, rec.ok),
+                         ("planner", "planner-v2", "surplus-v1", "gemini-3.6-flash", True))
+        self.assertIn("investable", rec.figure_ids)
+        self.assertEqual(len(rec.figures_hash), 64)
+
+    def test_bad_model_output_is_rejected_and_recorded(self):
+        from .llm.gemini import GeminiProvider
+        from .models import AIInteraction
+        self.client.patch("/api/finance/profile/", {"consent_ai": True}, format="json")
+        with mock.patch.object(GeminiProvider, "generate_json", return_value=("not json", {"model_version": "x"})):
+            res = self.client.post("/api/ai/planner/", {}, format="json")
+        self.assertEqual((res.status_code, res.data["kind"]), (502, "bad_output"))
+        self.assertEqual(AIInteraction.objects.get().error_kind, "bad_output")
+
+    def test_planner_is_rate_limited(self):
+        from rest_framework.settings import api_settings
+        self.client.patch("/api/finance/profile/", {"consent_ai": True}, format="json")
+        with mock.patch.dict(api_settings.DEFAULT_THROTTLE_RATES, {"ai_planner": "1/hour"}):
+            codes = [self.run_planner({"summary": "ok"}).status_code for _ in range(2)]
+        self.assertEqual(codes, [200, 429])

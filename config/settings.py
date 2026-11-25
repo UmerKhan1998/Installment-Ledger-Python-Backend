@@ -44,6 +44,7 @@ INSTALLED_APPS = [
     "accounts",
     "ledger",
     "expenses",
+    "finance",
     "assistant",
 ]
 
@@ -171,7 +172,7 @@ REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": ("rest_framework.permissions.IsAuthenticated",),
     # Scoped limits only where calls cost money or hit third parties (views opt in with `throttle_scope`).
     "DEFAULT_THROTTLE_CLASSES": ("rest_framework.throttling.ScopedRateThrottle",),
-    "DEFAULT_THROTTLE_RATES": {"ai_test": os.getenv("AI_TEST_RATE", "20/hour")},
+    "DEFAULT_THROTTLE_RATES": {"ai_test": os.getenv("AI_TEST_RATE", "20/hour"), "ai_planner": os.getenv("AI_PLANNER_RATE", "10/hour")},
 }
 
 SIMPLE_JWT = {
