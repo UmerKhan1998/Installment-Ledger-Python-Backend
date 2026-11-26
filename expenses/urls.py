@@ -9,6 +9,7 @@ from .projects import (
     ProjectTemplatesView,
 )
 
+from .transfer_views import ExpenseExportView, ImportCommitView, ImportPreviewView, ProjectExportView
 from .views import (
     BudgetView,
     CategoriesView,
@@ -35,7 +36,11 @@ urlpatterns = [
     path("categories/", CategoriesView.as_view(), name="expense-categories"),
     path("bulk-delete/", ExpenseBulkDeleteView.as_view(), name="expense-bulk-delete"),
     path("copy-recurring/", CopyRecurringView.as_view(), name="expense-copy-recurring"),
+    path("export/", ExpenseExportView.as_view(), name="expense-export"),
+    path("import/preview/", ImportPreviewView.as_view(), name="expense-import-preview"),
+    path("import/", ImportCommitView.as_view(), name="expense-import"),
     path("projects/", ProjectListCreateView.as_view(), name="project-list"),
+    path("projects/<int:pk>/export/", ProjectExportView.as_view(), name="project-export"),
     path("projects/templates/", ProjectTemplatesView.as_view(), name="project-templates"),
     path("projects/<int:pk>/", ProjectDetailView.as_view(), name="project-detail"),
     path("projects/<int:project_id>/expenses/", ProjectExpenseListCreateView.as_view(), name="project-expense-list"),

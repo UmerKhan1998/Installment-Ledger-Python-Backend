@@ -110,6 +110,7 @@ class CrossUserIsolationTests(APITestCase):
             "api/plans/<int:plan_id>/payments/bulk-delete/": f"/api/plans/{i['plan_id']}/payments/bulk-delete/",
             "api/expenses/<int:pk>/": f"/api/expenses/{i['pk_expense']}/",
             "api/expenses/projects/<int:pk>/": f"/api/expenses/projects/{i['pk_project']}/",
+            "api/expenses/projects/<int:pk>/export/": f"/api/expenses/projects/{i['pk_project']}/export/",
             "api/expenses/projects/<int:project_id>/expenses/": f"/api/expenses/projects/{i['project_id']}/expenses/",
             "api/expenses/projects/<int:project_id>/expenses/<int:pk>/": f"/api/expenses/projects/{i['project_id']}/expenses/{i['pk_pexp']}/",
             "api/expenses/projects/<int:project_id>/expenses/bulk-delete/": f"/api/expenses/projects/{i['project_id']}/expenses/bulk-delete/",
