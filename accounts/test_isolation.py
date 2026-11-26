@@ -16,6 +16,7 @@ from expenses.models import Expense, ExpenseSettings, GlobalBudget, MonthBudget,
 from assistant.models import PlannerChat, PlannerMessage
 from finance.models import FinancialProfile, Goal
 from ledger.models import Payment, Plan
+from notes.models import Note
 from tasks.models import Task
 
 PASSWORD = "Sup3r-secret!"
@@ -64,6 +65,7 @@ class CrossUserIsolationTests(APITestCase):
         self.goal = c.post("/api/finance/goals/", {"name": "A's goal", "target_amount": "777777", "target_date": "2028-01-01"}, format="json").data
         c.patch("/api/finance/profile/", {"monthly_income": "123456", "consent_use_ledger": True}, format="json")
         self.task = c.post("/api/tasks/", {"title": "A's secret task", "notes": "A's notes"}, format="json").data
+        self.note = c.post("/api/notes/", {"title": "A's private note", "body": "A's PIN is 4321"}, format="json").data
         self.chat = PlannerChat.objects.create(user_id=self.a, title="A's private question", page="Invest")
         PlannerMessage.objects.create(chat=self.chat, role="user", text="A's private question")
         self.counts = self.snapshot()
@@ -88,13 +90,14 @@ class CrossUserIsolationTests(APITestCase):
             "income": FinancialProfile.objects.get(user_id=self.a).monthly_income,
             "chats": list(PlannerChat.objects.filter(user_id=self.a).values_list("title", flat=True)),
             "chat_messages": PlannerMessage.objects.filter(chat__user_id=self.a).count(),
+            "notes": list(Note.objects.filter(user_id=self.a).values_list("title", "body", "pinned")),
             "tasks": list(Task.objects.filter(user_id=self.a).values_list("title", "status", "position")),
         }
 
     def ids(self):
         return {"pk_plan": self.plan["id"], "plan_id": self.plan["id"], "pk_payment": self.payment["id"],
                 "pk_expense": self.expense["id"], "project_id": self.project["id"], "pk_project": self.project["id"],
-                "pk_pexp": self.pexp["id"], "pk_goal": self.goal["id"], "pk_chat": self.chat.id, "pk_task": self.task["id"]}
+                "pk_pexp": self.pexp["id"], "pk_goal": self.goal["id"], "pk_chat": self.chat.id, "pk_task": self.task["id"], "pk_note": self.note["id"]}
 
     def object_urls(self):
         """Every route with an id, filled with user A's ids."""
@@ -113,6 +116,7 @@ class CrossUserIsolationTests(APITestCase):
             "api/finance/goals/<int:pk>/": f"/api/finance/goals/{i['pk_goal']}/",
             "api/ai/chats/<int:pk>/": f"/api/ai/chats/{i['pk_chat']}/",
             "api/tasks/<int:pk>/": f"/api/tasks/{i['pk_task']}/",
+            "api/notes/<int:pk>/": f"/api/notes/{i['pk_note']}/",
             "api/tasks/<int:pk>/move/": f"/api/tasks/{i['pk_task']}/move/",
         }
 
@@ -132,12 +136,12 @@ class CrossUserIsolationTests(APITestCase):
 
     def test_b_sees_none_of_a_data_in_lists_and_summaries(self):
         c = self.client
-        a_markers = ("A's", "REF-A-1", "99999", "500000", "40000", "777777", "123456")
+        a_markers = ("4321", "A's", "REF-A-1", "99999", "500000", "40000", "777777", "123456")
         for url in ("/api/plans/", "/api/summary/", "/api/expenses/?month=2026-11", "/api/expenses/summary/?month=2026-11",
                     "/api/expenses/projects/", "/api/expenses/settings/", "/api/expenses/budget/?month=2026-11",
                     "/api/expenses/rates/?month=2026-11", "/api/expenses/rates/history/?months=24", "/api/auth/me/",
                     "/api/payments/duplicate-check/?reference=REF-A-1", "/api/finance/profile/", "/api/finance/assessment/",
-                    "/api/finance/goals/", "/api/ai/settings/", "/api/ai/chats/", "/api/ai/chats/?q=private", "/api/tasks/", "/api/tasks/?q=secret"):
+                    "/api/finance/goals/", "/api/ai/settings/", "/api/ai/chats/", "/api/ai/chats/?q=private", "/api/tasks/", "/api/tasks/?q=secret", "/api/notes/", "/api/notes/?q=PIN"):
             res = c.get(url)
             self.assertEqual(res.status_code, 200, url)
             body = res.content.decode()

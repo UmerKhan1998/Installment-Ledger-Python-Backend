@@ -47,6 +47,7 @@ INSTALLED_APPS = [
     "finance",
     "assistant",
     "tasks",
+    "notes",
 ]
 
 MIDDLEWARE = [
